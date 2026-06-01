@@ -142,4 +142,3 @@ fn render_model_level(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut state);
     app.model_picker_models.scroll_offset = state.offset();
 }
-}

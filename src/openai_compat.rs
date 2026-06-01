@@ -10,6 +10,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::ollama::{ChatMessage, StreamItem, Tool, ToolCall, ToolCallFunction};
 
@@ -92,31 +93,59 @@ impl Client {
             model,
             messages: &oai_messages,
             stream: true,
+            max_tokens: 32_000,
+            stream_options: OaiStreamOptions {
+                include_usage: true,
+            },
             tools: tools.as_deref(),
         };
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&req)
-            .send()
-            .await?;
-        // Surface the response body on non-2xx. `.error_for_status()`
-        // drops the body — useful for "did it work?" but useless for
-        // debugging, which is exactly when we need it. Providers
-        // (opencode, openrouter, z.ai) all return structured JSON
-        // errors like `{"error":{"message":"context length exceeded"}}`
-        // that the user needs to see; bare "HTTP 400" tells them
-        // nothing actionable.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            // Truncate to keep one bad request from flooding the chat
-            // — most provider errors are well under this anyway.
-            let preview: String = body.chars().take(1000).collect();
-            return Err(anyhow!("POST {url}: HTTP {status} — {}", preview.trim()));
-        }
-        let byte_stream = resp.bytes_stream();
+        // Retry on transient server-side errors (502/503/429) with
+        // exponential backoff. The hmanlab-prox backend can return 502
+        // when all upstream channels are momentarily busy — a short
+        // wait usually lets the proxy recover. 429 means rate-limited;
+        // 503 means upstream overloaded. Client errors (4xx except 429)
+        // are never retried — they indicate bad requests, not transient
+        // failures.
+        const MAX_ATTEMPTS: u32 = 4;
+        const BASE_DELAY_MS: u64 = 800;
+        let mut last_err = String::new();
+        let byte_stream = 'retry: {
+            for attempt in 0..MAX_ATTEMPTS {
+                let resp = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .json(&req)
+                    .send()
+                    .await?;
+                let status = resp.status();
+                // Surface the response body on non-2xx. `.error_for_status()`
+                // drops the body — useful for "did it work?" but useless for
+                // debugging, which is exactly when we need it. Providers
+                // (opencode, openrouter, z.ai) all return structured JSON
+                // errors like `{"error":{"message":"context length exceeded"}}`
+                // that the user needs to see; bare "HTTP 400" tells them
+                // nothing actionable.
+                if status.is_success() {
+                    break 'retry resp.bytes_stream();
+                }
+                // Retry on transient errors; bail immediately on client errors.
+                let retryable = status.as_u16() == 429
+                    || status.as_u16() == 502
+                    || status.as_u16() == 503
+                    || status.as_u16() == 504;
+                let body = resp.text().await.unwrap_or_default();
+                let preview: String = body.chars().take(1000).collect();
+                last_err = format!("POST {url}: HTTP {status} — {}", preview.trim());
+                if !retryable || attempt + 1 == MAX_ATTEMPTS {
+                    return Err(anyhow!("{}", last_err));
+                }
+                // Exponential backoff: 800ms, 1.6s, 3.2s
+                let delay = BASE_DELAY_MS * (1u64 << attempt);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            return Err(anyhow!("{}", last_err));
+        };
 
         // Accumulator for streamed tool_calls (arguments arrive as fragments).
         let stream = futures::stream::unfold(
@@ -125,8 +154,10 @@ impl Client {
                 Vec::<u8>::new(),
                 Vec::<PartialToolCall>::new(),
                 false,
+                0u32, // stashed prompt_tokens
+                0u32, // stashed completion_tokens
             ),
-            |(mut bs, mut buf, mut tcs, mut done)| async move {
+            |(mut bs, mut buf, mut tcs, mut done, mut stash_pt, mut stash_ct)| async move {
                 if done {
                     return None;
                 }
@@ -151,20 +182,30 @@ impl Client {
                                 let calls = finalize_calls(std::mem::take(&mut tcs));
                                 return Some((
                                     Ok(StreamItem::ToolCalls(calls)),
-                                    (bs, buf, tcs, done),
+                                    (bs, buf, tcs, done, stash_pt, stash_ct),
                                 ));
                             }
-                            // No usage info on [DONE] frame; emit zeros.
+                            // With stream_options.include_usage, usage arrives on the
+                            // [DONE] chunk itself (some providers) or the last data
+                            // chunk before it. Use whatever we stashed.
                             return Some((
                                 Ok(StreamItem::Done {
-                                    prompt_tokens: 0,
-                                    completion_tokens: 0,
+                                    prompt_tokens: stash_pt,
+                                    completion_tokens: stash_ct,
                                 }),
-                                (bs, buf, tcs, done),
+                                (bs, buf, tcs, done, stash_pt, stash_ct),
                             ));
                         }
                         match serde_json::from_str::<OaiChunk>(payload) {
                             Ok(chunk) => {
+                                // Stash usage from every chunk — with include_usage,
+                                // it arrives on the finish_reason chunk and/or [DONE].
+                                if let Some(ref u) = chunk.usage {
+                                    if u.prompt_tokens > 0 || u.completion_tokens > 0 {
+                                        stash_pt = u.prompt_tokens;
+                                        stash_ct = u.completion_tokens;
+                                    }
+                                }
                                 let choice = match chunk.choices.into_iter().next() {
                                     Some(c) => c,
                                     None => continue,
@@ -193,36 +234,21 @@ impl Client {
                                     if !content.is_empty() {
                                         return Some((
                                             Ok(StreamItem::Content(content)),
-                                            (bs, buf, tcs, done),
+                                            (bs, buf, tcs, done, stash_pt, stash_ct),
                                         ));
                                     }
                                 }
                                 if choice.finish_reason.is_some() {
-                                    let usage = chunk.usage;
-                                    let pt = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
-                                    let ct =
-                                        usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                                    let pt = stash_pt;
+                                    let ct = stash_ct;
                                     if !tcs.is_empty() {
                                         let calls = finalize_calls(std::mem::take(&mut tcs));
-                                        // Stash the Done for next iter via `done` flag.
-                                        done = true;
-                                        // We can only emit one item per iter — emit
-                                        // ToolCalls now, the synthesized Done will fire
-                                        // on the next loop where done=true triggers
-                                        // None... so we need to push usage too. Emit
-                                        // ToolCalls now and a follow-up Done by
-                                        // re-enqueueing in buf. Simpler: emit Done
-                                        // here after ToolCalls. We'll yield ToolCalls
-                                        // and a sentinel — for now, finish_reason on
-                                        // tool_calls means the assistant emitted only
-                                        // tool calls; emit them with usage=Done next
-                                        // iter using a hack: push usage info to a
-                                        // local frame.
-                                        // Implementation: stash usage and yield Done
-                                        // after the tool calls via a one-shot follow.
+                                        // Emit ToolCalls now; the Done with real token
+                                        // counts fires on the next [DONE] frame using
+                                        // the stashed pt/ct.
                                         return Some((
                                             Ok(StreamItem::ToolCalls(calls)),
-                                            (bs, buf, tcs, done),
+                                            (bs, buf, tcs, done, pt, ct),
                                         ));
                                     }
                                     done = true;
@@ -231,7 +257,7 @@ impl Client {
                                             prompt_tokens: pt,
                                             completion_tokens: ct,
                                         }),
-                                        (bs, buf, tcs, done),
+                                        (bs, buf, tcs, done, stash_pt, stash_ct),
                                     ));
                                 }
                             }
@@ -242,7 +268,10 @@ impl Client {
                     match bs.next().await {
                         Some(Ok(b)) => buf.extend_from_slice(&b),
                         Some(Err(e)) => {
-                            return Some((Err(anyhow!(e)), (bs, buf, tcs, done)));
+                            return Some((
+                                Err(anyhow!(e)),
+                                (bs, buf, tcs, done, stash_pt, stash_ct),
+                            ));
                         }
                         None => {
                             // Stream closed without [DONE]. Flush whatever we have.
@@ -251,16 +280,16 @@ impl Client {
                                 done = true;
                                 return Some((
                                     Ok(StreamItem::ToolCalls(calls)),
-                                    (bs, buf, tcs, done),
+                                    (bs, buf, tcs, done, stash_pt, stash_ct),
                                 ));
                             }
                             done = true;
                             return Some((
                                 Ok(StreamItem::Done {
-                                    prompt_tokens: 0,
-                                    completion_tokens: 0,
+                                    prompt_tokens: stash_pt,
+                                    completion_tokens: stash_ct,
                                 }),
-                                (bs, buf, tcs, done),
+                                (bs, buf, tcs, done, stash_pt, stash_ct),
                             ));
                         }
                     }
@@ -334,8 +363,15 @@ struct OaiRequest<'a> {
     model: &'a str,
     messages: &'a [OaiMessage],
     stream: bool,
+    max_tokens: u32,
+    stream_options: OaiStreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Tool]>,
+}
+
+#[derive(Serialize)]
+struct OaiStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]

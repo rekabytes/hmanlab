@@ -6,7 +6,7 @@
 use tokio::sync::mpsc;
 
 use crate::config::{
-    ExtraModel, HMANLAB_HOSTED_MODELS, HMANLAB_HOSTED_PROVIDER, OLLAMA_CLOUD_BASE,
+    ExtraModel, HMANLAB_BASE, HMANLAB_MODELS, HMANLAB_PROVIDER, OLLAMA_CLOUD_BASE,
     OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_PROVIDER, OPENCODE_BASE, OPENCODE_MODELS, OPENCODE_PROVIDER,
     OPENROUTER_BASE, OPENROUTER_MODELS, OPENROUTER_PROVIDER, OPENROUTER_VENDORS, ZAI_MODELS,
     ZAI_SUBSCRIPTION_BASE, ZAI_SUBSCRIPTION_PROVIDER, ZAI_USAGE_BASE, ZAI_USAGE_PROVIDER,
@@ -34,14 +34,7 @@ impl App {
             Some(OLLAMA_CLOUD_PROVIDER) => OLLAMA_CLOUD_BASE,
             Some(OPENCODE_PROVIDER) => OPENCODE_BASE,
             Some(OPENROUTER_PROVIDER) => OPENROUTER_BASE,
-            // Hosted-chat: route shows the hmanlab-api host since that's
-            // where the request actually goes. The user's traffic flows
-            // through the proxy, not directly to OpenCode.
-            Some(HMANLAB_HOSTED_PROVIDER) => self
-                .api
-                .as_ref()
-                .map(|c| c.base())
-                .unwrap_or(&self.client.base),
+            Some(HMANLAB_PROVIDER) => HMANLAB_BASE,
             _ => &self.client.base,
         }
     }
@@ -64,18 +57,6 @@ impl App {
         let Some(provider) = provider else {
             return Some(LlmBackend::Ollama(self.client.clone()));
         };
-        // Hosted-chat path doesn't use byok_keys — the credential is the
-        // user's already-loaded `bai_` token on the api client. Bail out
-        // early if the api client isn't configured (e.g. user dismissed
-        // the first-run wizard) since there's nowhere to send the request.
-        if provider == HMANLAB_HOSTED_PROVIDER {
-            let api = self.api.as_ref()?;
-            let base = format!("{}/v1", api.base().trim_end_matches('/'));
-            return Some(LlmBackend::OpenAi(openai_compat::Client::new(
-                base,
-                api.api_key().to_string(),
-            )));
-        }
         let key = self.byok_key(provider)?.to_string();
         match provider {
             ZAI_SUBSCRIPTION_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
@@ -86,21 +67,20 @@ impl App {
                 ZAI_USAGE_BASE.to_string(),
                 key,
             ))),
-            OLLAMA_CLOUD_PROVIDER => {
-                // Cloud Ollama speaks the same native protocol as local
-                // Ollama; only auth + host differ. Reuse the Ollama backend
-                // variant with a Bearer-authed client.
-                Some(LlmBackend::Ollama(Client::with_api_key(
-                    OLLAMA_CLOUD_BASE.to_string(),
-                    key,
-                )))
-            }
+            OLLAMA_CLOUD_PROVIDER => Some(LlmBackend::Ollama(Client::with_api_key(
+                OLLAMA_CLOUD_BASE.to_string(),
+                key,
+            ))),
             OPENCODE_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
                 OPENCODE_BASE.to_string(),
                 key,
             ))),
             OPENROUTER_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
                 OPENROUTER_BASE.to_string(),
+                key,
+            ))),
+            HMANLAB_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
+                HMANLAB_BASE.to_string(),
                 key,
             ))),
             _ => None,
@@ -141,10 +121,9 @@ impl App {
 
     /// Public bridge for main.rs to migrate older configs at startup.
     /// Idempotent: re-applies known models to extra_models for every
-    /// configured provider key, and rewrites the legacy `"zai"` provider
-    /// string to `"zai-subscription"` so old configs keep working.
-    pub fn ensure_zai_models_pub(&mut self) {
-        self.migrate_legacy_zai_provider();
+    /// configured provider key, and rewrites legacy provider strings.
+    pub fn ensure_byok_models_pub(&mut self) {
+        self.migrate_legacy_providers();
         if self.has_byok_key(ZAI_SUBSCRIPTION_PROVIDER) {
             self.ensure_zai_models_for(ZAI_SUBSCRIPTION_PROVIDER);
         }
@@ -160,25 +139,19 @@ impl App {
         if self.has_byok_key(OPENROUTER_PROVIDER) {
             self.ensure_openrouter_models();
         }
-        // Hosted-chat is unconditional — availability is gated by the api
-        // client (built only when `api_key` is present), and the picker
-        // just won't pick it if the backend builder returns None.
-        self.ensure_hosted_models();
+        if self.has_byok_key(HMANLAB_PROVIDER) {
+            self.ensure_hmanlab_models();
+        }
         self.persist_config();
     }
 
-    /// Replace any persisted `hmanlab` (hosted) entries with the current
-    /// HMANLAB_HOSTED_MODELS list. Same canonical-replacement pattern as
-    /// `ensure_ollama_cloud_models` — the model whitelist is decided by
-    /// the API server, so stale picker rows from an older client release
-    /// would just 400 on click. Seeding here ensures the picker shows
-    /// only what the server actually accepts today.
-    pub(super) fn ensure_hosted_models(&mut self) {
-        self.extra_models
-            .retain(|m| m.provider != HMANLAB_HOSTED_PROVIDER);
-        for name in HMANLAB_HOSTED_MODELS {
+    /// Replace any persisted `hmanlab` entries with the current HMANLAB_MODELS
+    /// seed. Same canonical-replacement pattern as other providers.
+    pub(super) fn ensure_hmanlab_models(&mut self) {
+        self.extra_models.retain(|m| m.provider != HMANLAB_PROVIDER);
+        for name in HMANLAB_MODELS {
             self.extra_models.push(ExtraModel {
-                provider: HMANLAB_HOSTED_PROVIDER.to_string(),
+                provider: HMANLAB_PROVIDER.to_string(),
                 name: (*name).to_string(),
             });
         }
@@ -322,20 +295,14 @@ impl App {
         });
     }
 
-    /// Rewrite any `provider: "zai"` entries (pre-split config) to
-    /// `"zai-subscription"`. Safe to call repeatedly.
-    pub(super) fn migrate_legacy_zai_provider(&mut self) {
+    /// Rewrite legacy provider strings to current ids. Safe to call repeatedly.
+    pub(super) fn migrate_legacy_providers(&mut self) {
         for em in self.extra_models.iter_mut() {
             if em.provider == "zai" {
                 em.provider = ZAI_SUBSCRIPTION_PROVIDER.to_string();
             }
-            // Hosted-chat provider was briefly called "hmanlab" before
-            // the user-facing rename to "hmanlab-free" — translate any
-            // dev configs that persisted the old id so they don't leave
-            // an orphan picker row pointing at a provider that no
-            // longer exists.
-            if em.provider == "hmanlab" {
-                em.provider = HMANLAB_HOSTED_PROVIDER.to_string();
+            if em.provider == "hmanlab-prox" {
+                em.provider = HMANLAB_PROVIDER.to_string();
             }
         }
     }
@@ -367,6 +334,7 @@ impl App {
             cfg.ollama_cloud_api_key = snap.byok_keys.get(OLLAMA_CLOUD_PROVIDER).cloned();
             cfg.opencode_api_key = snap.byok_keys.get(OPENCODE_PROVIDER).cloned();
             cfg.openrouter_api_key = snap.byok_keys.get(OPENROUTER_PROVIDER).cloned();
+            cfg.hmanlab_api_key = snap.byok_keys.get(HMANLAB_PROVIDER).cloned();
             cfg.extra_models = snap.extra_models;
             cfg.agents = snap.agents;
             let _ = crate::config::save(&cfg);

@@ -129,20 +129,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    // For the hmanlab-free hosted provider, swap the real backend host
-    // (the hmanlab-api domain) with a cosmetic "api.hmanlab" label.
-    // Cosmetic only — `current_host()` still returns the actual URL
-    // for any code path that needs to connect somewhere, and switching
-    // back to any other provider shows that provider's real host as
-    // usual. Centralised here because this is the only place the host
-    // is user-facing.
-    let host_short = if app.selected_extra.as_ref().map(|e| e.provider.as_str())
-        == Some(crate::config::HMANLAB_HOSTED_PROVIDER)
-    {
-        "api.hmanlab".to_string()
-    } else {
-        mask_host(app.current_host())
-    };
+    let host_short = mask_host(app.current_host());
     let total_tokens = app.total_prompt_tokens + app.total_completion_tokens;
     let tokens_label = format_tokens(total_tokens);
 

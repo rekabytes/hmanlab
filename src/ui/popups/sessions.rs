@@ -4,7 +4,7 @@
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
-    widgets::{Clear, List, ListItem, Padding},
+    widgets::{Clear, List, ListItem, ListState, Padding},
     Frame,
 };
 
@@ -39,5 +39,7 @@ pub(in crate::ui) fn render_session_picker(f: &mut Frame, area: Rect, app: &App)
     let title = format!("sessions ({}) — ↑↓ Enter Esc", app.session_picker.len());
     let list =
         List::new(items).block(theme::popup_block(&title, false).padding(Padding::horizontal(1)));
-    f.render_widget(list, area);
+    let mut state = ListState::default();
+    state.select(Some(app.session_picker.index));
+    f.render_stateful_widget(list, area, &mut state);
 }

@@ -20,6 +20,7 @@ mod config;
 mod memory;
 mod ollama;
 mod openai_compat;
+mod session;
 mod telegram;
 mod tools;
 mod trust;
@@ -32,7 +33,7 @@ use app::{App, AppAction, StreamMsg};
 #[command(
     name = "hmanlab",
     version,
-    about = "hmanlab — terminal UI for Ollama, backed by hmanlab-api"
+    about = "hmanlab — terminal UI for Ollama and BYOK providers. No account required."
 )]
 struct Cli {
     /// Ollama URL. Overrides config; falls back to http://localhost:11434.
@@ -41,14 +42,6 @@ struct Cli {
 
     #[arg(long, env = "OLLAMA_MODEL")]
     model: Option<String>,
-
-    /// hmanlab-api URL for session persistence. Overrides config.
-    #[arg(long, env = "HMANLAB_API_URL")]
-    api_url: Option<String>,
-
-    /// hmanlab API key. Overrides config; runs the first-run wizard if absent.
-    #[arg(long, env = "HMANLAB_API_KEY")]
-    api_key: Option<String>,
 
     #[arg(long, value_name = "PATH")]
     workspace: Option<std::path::PathBuf>,
@@ -59,26 +52,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let saved = config::load().ok().flatten().unwrap_or_default();
-    let api_url = cli
-        .api_url
-        .or(saved.api_url.clone())
-        .unwrap_or_else(|| config::DEFAULT_API_URL.to_string());
 
-    // Resolve api_key: flag/env > config > prompt
-    let api_key = match cli.api_key.or(saved.api_key.clone()) {
-        Some(k) => k,
-        None => {
-            let cfg = config::run_setup_wizard(&api_url, saved.ollama_host.as_deref()).await?;
-            cfg.api_key.expect("wizard guarantees api_key")
-        }
+    // First-run: if no config file exists at all, offer the provider wizard.
+    // We detect "first run" by the absence of any provider key — a config
+    // file with only a workspace entry or Ollama host is not first-run.
+    let is_first_run = config::path().map(|p| !p.exists()).unwrap_or(false);
+    let wizard_result = if is_first_run {
+        Some(config::run_setup_wizard(saved.ollama_host.as_deref()).await?)
+    } else {
+        None
     };
 
-    // Re-load config so ollama_host reflects anything the wizard just wrote.
-    let mut saved2 = config::load().ok().flatten().unwrap_or_default();
+    // Re-load config so we pick up anything the wizard just wrote.
+    let mut saved2 = if is_first_run {
+        wizard_result.unwrap_or_default()
+    } else {
+        config::load().ok().flatten().unwrap_or_default()
+    };
+
     // Has the user explicitly told us about Ollama — either via --host flag or
-    // a saved config entry from onboarding? If neither, they skipped the
-    // wizard's local-LLM step; don't auto-probe localhost behind their back.
-    // They can add it later with /host <url>.
+    // a saved config entry? If neither, don't auto-probe localhost.
     let user_supplied_host = cli.host.clone().or(saved2.ollama_host.clone());
     let ollama_host = user_supplied_host
         .clone()
@@ -92,9 +85,6 @@ async fn main() -> Result<()> {
     };
     let workspace = workspace.canonicalize().unwrap_or(workspace);
 
-    // Pre-TUI trust prompt. Fires only when this workspace isn't already
-    // on the persisted trusted list, so repeat launches in the same folder
-    // don't re-ask. We mutate `saved2` and re-save so the new entry sticks.
     let workspace_str = workspace.display().to_string();
     let already_trusted = saved2
         .trusted_workspaces
@@ -104,16 +94,12 @@ async fn main() -> Result<()> {
         match trust::prompt_workspace_trust(&workspace) {
             Ok(true) => {
                 saved2.trusted_workspaces.push(workspace_str.clone());
-                // Best-effort persist — if save fails, the trust still
-                // applies for this session via the in-memory list below.
                 if let Err(e) = config::save(&saved2) {
                     eprintln!("warn: failed to persist trust decision: {e}");
                 }
             }
             Ok(false) => {}
             Err(e) => {
-                // Don't block startup on a prompt error — just leave
-                // the workspace untrusted and continue into the TUI.
                 eprintln!("warn: trust prompt failed: {e}");
             }
         }
@@ -125,33 +111,15 @@ async fn main() -> Result<()> {
         Vec::new()
     };
 
-    let api_client_built = api::Client::new(api_url.clone(), api_key.clone());
-    let (api_client, api_tx, api_warning) = match api_client_built.check_auth().await {
-        Ok(()) => {
-            let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(api::run_writer(api_client_built.clone(), rx));
-            (Some(api_client_built), Some(tx), None)
-        }
-        Err(e) => (None, None, Some(format!("hmanlab-api unreachable: {e}"))),
-    };
-
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Boot App with a placeholder model; we'll resolve the real default
-    // below once we've loaded BYOK extras (otherwise a z.ai-only user gets
-    // stuck on a bogus "llama3.2" default that Ollama can't serve).
-    let mut app = App::new(client, String::new(), models, workspace, api_client, api_tx);
-    // Pre-seed the sidebar's expanded set so the first paint shows one level
-    // of contents under the workspace root, not just the root entry alone.
+    let mut app = App::new(client, String::new(), models, workspace);
     app.seed_sidebar_top_level();
 
-    // Carry BYOK state into the app so /model can show + use extra models.
-    // On-disk format keeps the per-provider fields for backwards compat;
-    // App-side everything is one HashMap keyed by provider id.
     if let Some(k) = saved2.zai_api_key.clone() {
         app.set_byok_key(config::ZAI_SUBSCRIPTION_PROVIDER, k);
     }
@@ -167,45 +135,26 @@ async fn main() -> Result<()> {
     if let Some(k) = saved2.openrouter_api_key.clone() {
         app.set_byok_key(config::OPENROUTER_PROVIDER, k);
     }
+    if let Some(k) = saved2.hmanlab_api_key.clone() {
+        app.set_byok_key(config::HMANLAB_PROVIDER, k);
+    }
     app.extra_models = saved2.extra_models.clone();
-    // Mirror the persisted "DM me when I walk away" preference. The bot
-    // task itself reads the allowlist on each message, but the on_done
-    // hot path reads this flag, so we cache it on App.
     app.telegram_notify_on_idle = saved2.telegram_notify_on_idle;
-    // Specialist agents roster. Session activation stays off by design
-    // — the user opts in per-session with `/agents on`.
     app.agents = saved2.agents.clone();
-    // Workspace trust list — paths stored as canonical strings. Recompute
-    // whether the current workspace sits in that list so the confirm
-    // interceptor in `app::stream` can short-circuit destructive tools.
     app.trusted_workspaces = saved2
         .trusted_workspaces
         .iter()
         .map(std::path::PathBuf::from)
         .collect();
-    // Re-seed now that we know the trust state — the first call above
-    // ran with an empty trusted_workspaces list, so trusted workspaces
-    // wouldn't have shown their dotfile dirs at root. `seed` reads
-    // `workspace_trusted()` which now matches the loaded list.
     app.seed_sidebar_top_level();
-    // Migrate older configs: a saved BYOK key means the matching provider's
-    // models should be available, even if the user previously added only one.
-    // Also rewrites legacy provider="zai" → "zai-subscription".
     if !app.byok_keys.is_empty() {
-        app.ensure_zai_models_pub();
+        app.ensure_byok_models_pub();
     }
 
-    // Initial model resolution order:
-    //   1. --model flag (explicit user intent on this launch)
-    //   2. last-used model from config (persistence across restarts)
-    //   3. first Ollama-discovered model
-    //   4. first BYOK extra
-    // We pick AFTER loading extras so a z.ai-only user lands on glm-4.7
-    // instead of a doomed "llama3.2" → Ollama route.
     let last_model = saved2.last_model.as_deref();
     let last_provider = saved2.last_provider.as_deref();
     let last_extra = last_model.and_then(|name| {
-        let want_provider = last_provider; // None → Ollama; Some → BYOK
+        let want_provider = last_provider;
         match want_provider {
             Some(prov) => app
                 .extra_models
@@ -215,11 +164,8 @@ async fn main() -> Result<()> {
             None => None,
         }
     });
-    let last_ollama = last_model.filter(|name| {
-        // Saved model points at Ollama (no provider) AND the host still
-        // serves it. If it was renamed/removed we fall through.
-        last_provider.is_none() && app.models.iter().any(|m| m == name)
-    });
+    let last_ollama =
+        last_model.filter(|name| last_provider.is_none() && app.models.iter().any(|m| m == name));
     if let Some(name) = cli.model.clone() {
         app.model = name.clone();
         app.selected_extra = app.extra_models.iter().find(|m| m.name == name).cloned();
@@ -237,25 +183,13 @@ async fn main() -> Result<()> {
         app.selected_extra = Some(em);
     }
 
-    // Status reflects the COMBINED count of Ollama + BYOK models, not just
-    // Ollama. A user with z.ai but no Ollama running should see "Ready",
-    // not "No models".
     let total = app.models.len() + app.extra_models.len();
-    let db_state = if app.api.is_some() {
-        "API on"
-    } else {
-        "API off"
-    };
     app.status = if total == 0 {
-        format!(
-            "No models — try /host <url> for Ollama, or /model to add a BYOK provider  ·  {db_state}"
-        )
+        "No models — try /host <url> for Ollama, or /model to add a BYOK provider  ·  /help for commands".to_string()
     } else {
-        format!("Ready — {total} model(s)  ·  {db_state}  ·  /help for commands")
+        format!("Ready — {total} model(s)  ·  /help for commands")
     };
-    if let Some(w) = api_warning {
-        app.status = format!("{w}  ·  running without persistence");
-    }
+
     let res = run(&mut terminal, app).await;
 
     disable_raw_mode()?;

@@ -4,18 +4,10 @@
 //!
 //!   - `chat`       — assistant chunks, turn lifecycle, errors.
 //!   - `tools`      — tool start/result + the confirm popup intercept.
-//!   - `sessions`   — `/sessions`, `/load`, `/more` results.
 //!   - `compaction` — `/compact` done/error + memory persistence.
 //!   - `system`     — host change, update notifications, `/settings`.
-//!
-//! `persist_assistant_if_any` and `api_message_to_chat` are the small
-//! shared helpers used by more than one of the above; they live here
-//! because they sit between the chat / sessions / compaction modules.
 
 use tokio::sync::mpsc;
-
-use crate::api::ApiOp;
-use crate::ollama::ChatMessage;
 
 use super::{App, StreamMsg};
 
@@ -59,9 +51,14 @@ impl App {
             StreamMsg::Settings(text) => self.on_settings(text),
             StreamMsg::UpdateResult { ok, text } => self.on_update_result(ok, text),
             StreamMsg::Models { models, base } => self.on_models(models, base),
-            StreamMsg::SessionList(rows) => self.on_session_list(rows),
-            StreamMsg::Loaded { session, messages } => self.on_loaded(session, messages),
-            StreamMsg::MoreLoaded { messages } => self.on_more_loaded(messages),
+            StreamMsg::LocalSessionList(rows) => self.on_local_session_list(rows),
+            StreamMsg::LocalSessionLoaded {
+                session_id,
+                title,
+                model,
+                messages,
+                path,
+            } => self.on_local_session_loaded(session_id, title, model, messages, path),
             StreamMsg::OpenRouterModelsRefreshed(models) => {
                 self.on_openrouter_models_refreshed(models)
             }
@@ -227,34 +224,18 @@ impl App {
                 if content.trim().is_empty() {
                     return;
                 }
-                let model = self.model.clone();
-                if let Some(api_tx) = &self.api_tx {
-                    let _ = api_tx.send(ApiOp::AssistantMessage { content, model });
+                // Write to local JSONL session.
+                if let (Some(sid), Some(path)) = (
+                    self.local_session_id.clone(),
+                    self.local_session_path.clone(),
+                ) {
+                    let model = self.model.clone();
+                    let c = content.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::session::write_assistant(&path, &sid, &c, &model);
+                    });
                 }
             }
         }
-    }
-}
-
-/// Convert a persisted `api::Message` (DB shape) into the in-memory
-/// `ChatMessage` the renderer uses. Carries `name` and `tool_calls`
-/// across the boundary — without this, `/load` and `/more` would drop
-/// both fields and tool rows would render as `tool({})` because the
-/// renderer couldn't find their function name or look up their args.
-pub(super) fn api_message_to_chat(m: &crate::api::Message) -> ChatMessage {
-    ChatMessage {
-        role: m.role.clone(),
-        content: m.content.clone(),
-        name: m.name.clone(),
-        // `api::Message` stores `tool_calls` as raw JSON (it's pass-through
-        // from whatever the model emitted). Best-effort parse into the
-        // typed shape — if a legacy row has a malformed value, we drop it
-        // rather than crash; the user will see `tool({})` for that single
-        // message, same as before this fix.
-        tool_calls: m
-            .tool_calls
-            .as_ref()
-            .and_then(|v| serde_json::from_value::<Vec<crate::ollama::ToolCall>>(v.clone()).ok()),
-        ..Default::default()
     }
 }

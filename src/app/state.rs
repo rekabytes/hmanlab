@@ -4,8 +4,6 @@
 
 use std::path::PathBuf;
 
-use crate::config::ExtraModel;
-
 /// Renderer-produced, input-consumed scratch state. The chat and sidebar
 /// renderers write geometry and hit-test tables here every frame; the
 /// mouse handler reads them on the next event to translate screen
@@ -58,8 +56,77 @@ pub struct RenderState {
     pub shell_indicator_w: u16,
 }
 
-/// Returned by event handlers to tell the main loop whether to keep
-/// running or shut down cleanly.
+/// Which level of the two-level model picker is active.
+///
+/// Level 1 lists providers (Ollama, z.ai, OpenRouter, …) plus "+"
+/// rows for unconnected providers. Level 2 lists the models within
+/// the provider the user selected on level 1. Esc on level 2 goes
+/// back to level 1; Esc on level 1 closes the picker entirely.
+#[derive(Clone, PartialEq, Default)]
+pub enum ModelPickerLevel {
+    #[default]
+    Provider,
+    Model,
+}
+
+/// What the model picker shows on level 1 — one row per provider group
+/// or one "+ Connect" row for unconfigured providers.
+#[derive(Clone, Debug)]
+pub enum ProviderRow {
+    /// An active provider (Ollama local, or a configured BYOK provider).
+    /// Carries the provider tag and the model count for the subtitle.
+    Active {
+        /// `None` = local Ollama, `Some(provider_id)` = BYOK.
+        provider: Option<String>,
+        label: String,
+        model_count: usize,
+    },
+    /// A provider the user hasn't connected yet. Selecting it opens AddModel.
+    Add(String),
+}
+
+impl ProviderRow {
+    pub fn display(&self) -> String {
+        match self {
+            ProviderRow::Active {
+                label, model_count, ..
+            } => {
+                format!("{label}  ({model_count})")
+            }
+            ProviderRow::Add(p) => {
+                format!("+ Connect {}", crate::config::provider_label(p))
+            }
+        }
+    }
+}
+
+/// Two-level picker entry — used on level 2 (models within a provider).
+#[derive(Clone, Debug)]
+pub enum ModelRow {
+    Ollama(String),
+    Extra(crate::config::ExtraModel),
+}
+
+impl ModelRow {
+    pub fn display(&self) -> String {
+        match self {
+            ModelRow::Ollama(n) => n.clone(),
+            ModelRow::Extra(m) => m.name.clone(),
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            ModelRow::Ollama(n) => n.as_str(),
+            ModelRow::Extra(m) => m.name.as_str(),
+        }
+    }
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            ModelRow::Ollama(_) => None,
+            ModelRow::Extra(m) => Some(m.provider.as_str()),
+        }
+    }
+}
 #[derive(PartialEq)]
 pub enum AppAction {
     Continue,
@@ -178,6 +245,11 @@ pub enum TelegramSetupStep {
 pub struct Picker<T> {
     pub items: Vec<T>,
     pub index: usize,
+    /// Scroll offset — first visible row index. Kept in sync with `index`
+    /// by `select_next`/`select_prev` so the highlighted row is always on
+    /// screen. Callers that set `index` directly must call `clamp_scroll`
+    /// afterwards to keep the invariant.
+    pub scroll_offset: usize,
 }
 
 impl<T> Default for Picker<T> {
@@ -185,6 +257,7 @@ impl<T> Default for Picker<T> {
         Self {
             items: Vec::new(),
             index: 0,
+            scroll_offset: 0,
         }
     }
 }
@@ -193,6 +266,7 @@ impl<T> Picker<T> {
     pub fn set_items(&mut self, items: Vec<T>) {
         self.items = items;
         self.index = 0;
+        self.scroll_offset = 0;
     }
     pub fn select_next(&mut self) {
         if self.index + 1 < self.items.len() {
@@ -204,8 +278,22 @@ impl<T> Picker<T> {
             self.index -= 1;
         }
     }
+    /// Clamp `scroll_offset` so `index` is always within [offset, offset+visible).
+    /// Call this after any direct `index` assignment and after rendering to
+    /// learn the visible row count.
+    pub fn clamp_scroll(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            return;
+        }
+        if self.index < self.scroll_offset {
+            self.scroll_offset = self.index;
+        } else if self.index >= self.scroll_offset + visible_rows {
+            self.scroll_offset = self.index + 1 - visible_rows;
+        }
+    }
     pub fn select_first(&mut self) {
         self.index = 0;
+        self.scroll_offset = 0;
     }
     pub fn select_last(&mut self) {
         self.index = self.items.len().saturating_sub(1);
@@ -273,6 +361,10 @@ impl TurnState {
 ///
 /// Resets to `Idle` on `/clear`, `/new`, and `/load` (each starts a
 /// fresh pagination cursor).
+// Loading/Exhausted + their predicates are scaffolding for the in-flight
+// `/more` pagination work; constructed once that lands. Kept to avoid
+// churning the enum back and forth.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum PageState {
     Idle,
@@ -280,6 +372,7 @@ pub enum PageState {
     Exhausted,
 }
 
+#[allow(dead_code)]
 impl PageState {
     pub fn is_loading(self) -> bool {
         matches!(self, PageState::Loading)
@@ -326,33 +419,4 @@ pub struct DisconnectEntry {
     /// seeds a longer catalog. Lets the user see what they're about to
     /// drop before pressing Enter.
     pub preview: String,
-}
-
-/// What the `/model` picker can display. The picker mixes Ollama-discovered
-/// models with BYOK extras and trailing "Add …" action rows (one per
-/// unconfigured provider).
-#[derive(Clone)]
-pub enum PickerEntry {
-    Ollama(String),
-    Extra(ExtraModel),
-    /// "+ Add <provider> key" row — appears only when the matching
-    /// `byok_keys` entry isn't set. Provider id matches the
-    /// `*_PROVIDER` constants in `crate::config`. Replaces the old
-    /// AddZaiSubscription/AddZaiUsage/AddOllamaCloud/AddOpenCode/AddOpenRouter
-    /// per-provider variants — new providers can be added to
-    /// `crate::config::BYOK_PROVIDERS` and they'll surface here
-    /// automatically.
-    AddProvider(String),
-}
-
-impl PickerEntry {
-    pub fn display(&self) -> String {
-        match self {
-            PickerEntry::Ollama(name) => name.clone(),
-            PickerEntry::Extra(m) => format!("[{}] {}", m.provider, m.name),
-            PickerEntry::AddProvider(p) => {
-                format!("+ Add {} key", crate::config::provider_label(p))
-            }
-        }
-    }
 }

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
-use crate::api::{self, ApiOp};
+use crate::api::Session;
 use crate::config::ExtraModel;
 use crate::ollama::{Attachment, ChatMessage, Client};
 use crate::tools;
@@ -31,8 +31,8 @@ pub mod workspace;
 pub use backend::LlmBackend;
 pub use inline::{InlinePopup, SLASH_COMMANDS};
 pub use state::{
-    AgentsSetupStep, AppAction, DisconnectEntry, Mode, PageState, Picker, PickerEntry, RenderState,
-    ShellRuntime, TelegramSetupStep, TurnState,
+    AgentsSetupStep, AppAction, DisconnectEntry, Mode, ModelPickerLevel, ModelRow, PageState,
+    Picker, ProviderRow, RenderState, ShellRuntime, TelegramSetupStep, TurnState,
 };
 pub use stream_msg::StreamMsg;
 pub use viewer::OpenFile;
@@ -44,8 +44,6 @@ pub use viewer::OpenFile;
 /// devices.
 pub const TELEGRAM_IDLE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
-use crate::api::Session;
-
 /// Build a TextArea with no current-line underline (tui-textarea's default
 /// behavior is to underline the cursor row, which looks like a stray line in
 /// our chat input).
@@ -56,6 +54,34 @@ pub(super) fn fresh_textarea() -> TextArea<'static> {
 }
 
 impl App {
+    /// Ensure a local JSONL session exists for the current workspace.
+    /// Generates a new session ID + path and writes the meta record on
+    /// first call per session. No-op if a session is already active.
+    pub fn ensure_local_session(&mut self) {
+        if self.local_session_id.is_some() {
+            return;
+        }
+        let sid = crate::session::new_session_id();
+        let path = crate::session::session_path(&self.workspace, &sid)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/hmanlab-session.jsonl"));
+        // Derive title from first visible user message, if any.
+        let title = self
+            .messages
+            .iter()
+            .find(|m| m.role == "user" && !m.hidden)
+            .map(|m| crate::session::truncate_title(&m.content))
+            .unwrap_or_else(|| "New session".to_string());
+        let model = self.model.clone();
+        let sid_clone = sid.clone();
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            let _ = crate::session::write_meta(&path_clone, &sid_clone, &title, &model);
+        });
+        self.local_session_id = Some(sid);
+        self.local_session_path = Some(path);
+        self.local_session_meta_written = true;
+    }
+
     /// Reset the sidebar state to defaults for the current workspace: clear
     /// any user expansion + reset scroll, then re-seed the expanded set with
     /// the workspace root and its immediate visible directories. Called once
@@ -141,9 +167,12 @@ pub struct App {
     /// disk through `Config`'s per-field shape for backwards compat;
     /// `App::new`'s caller (`main.rs`) does the load-time conversion.
     pub byok_keys: HashMap<String, String>,
-    /// Entries rendered by the `/model` picker, built each time
-    /// `open_picker` runs. `Picker<T>` packs the cursor index alongside.
-    pub model_picker: Picker<PickerEntry>,
+    /// Entries rendered by the `/model` picker level 1 (provider list).
+    pub model_picker: Picker<ProviderRow>,
+    /// Entries rendered by the `/model` picker level 2 (models within provider).
+    pub model_picker_models: Picker<ModelRow>,
+    /// Which level of the two-level model picker is active.
+    pub model_picker_level: ModelPickerLevel,
     /// Provider being added in the current AddModel flow.
     pub add_model_provider: String,
     /// Free-text input for the AddModel modal (key or name).
@@ -156,6 +185,17 @@ pub struct App {
     /// Set when `/load` brings in a saved session, so /more knows where to page from.
     pub loaded_session_id: Option<String>,
     pub oldest_loaded_msg_id: Option<i64>,
+    /// Local JSONL session — ID of the current live session. `None` until
+    /// the first user message of the session is sent.
+    pub local_session_id: Option<String>,
+    /// Path to the `.jsonl` file for the current live session.
+    pub local_session_path: Option<PathBuf>,
+    /// True after the meta record has been written for this session.
+    pub local_session_meta_written: bool,
+    /// Cached summaries from the last `/sessions` list call.
+    /// Needed so the session picker's Enter handler can resolve a row back
+    /// to its file path without re-scanning disk.
+    pub local_session_summaries: Vec<crate::session::SessionSummary>,
     /// Pagination state for session-history loading. Replaces the old
     /// `loading_more` + `no_more_history` bool pair. `Loading` debounces
     /// scroll-triggered auto-loads; `Exhausted` short-circuits the
@@ -217,10 +257,6 @@ pub struct App {
     /// frame so we don't pay a sync `read_dir` per expanded directory
     /// on every redraw. Opaque to App; ui::sidebar owns the structure.
     pub sidebar_snapshot: Option<crate::ui::SidebarSnapshot>,
-    pub api: Option<api::Client>,
-    pub api_tx: Option<mpsc::UnboundedSender<ApiOp>>,
-    /// Newer hmanlab version advertised by npm, if the background
-    /// update check found one. Cleared until the check completes.
     pub update_available: Option<String>,
     /// Inline autocomplete popup overlaying the chat surface, if any.
     /// `Slash` when the user is typing `/<command>`, `File` when they're
@@ -406,27 +442,19 @@ pub struct TelegramRuntime {
 }
 
 impl App {
-    pub fn new(
-        client: Client,
-        model: String,
-        models: Vec<String>,
-        workspace: PathBuf,
-        api: Option<api::Client>,
-        api_tx: Option<mpsc::UnboundedSender<ApiOp>>,
-    ) -> Self {
+    pub fn new(client: Client, model: String, models: Vec<String>, workspace: PathBuf) -> Self {
         let mut input = fresh_textarea();
         input.set_placeholder_text(
             "Type a message, or /help for commands.  (Enter=send, Alt+Enter / Ctrl+J=newline)",
         );
-        let db_state = if api.is_some() { "API on" } else { "API off" };
         let status = if models.is_empty() {
             format!(
-                "No models — try /host <url> or check Ollama  ·  {db_state}  ·  ws={}",
+                "No models — try /host <url> or check Ollama  ·  ws={}",
                 workspace.display()
             )
         } else {
             format!(
-                "Ready — {} model(s)  ·  {db_state}  ·  ws={}  ·  /help for commands",
+                "Ready — {} model(s)  ·  ws={}  ·  /help for commands",
                 models.len(),
                 workspace.display()
             )
@@ -450,12 +478,18 @@ impl App {
             selected_extra: None,
             byok_keys: HashMap::new(),
             model_picker: Picker::default(),
+            model_picker_models: Picker::default(),
+            model_picker_level: ModelPickerLevel::Provider,
             add_model_provider: crate::config::ZAI_SUBSCRIPTION_PROVIDER.to_string(),
             add_model_input: fresh_textarea(),
             session_picker: Picker::default(),
             disconnect_picker: Picker::default(),
             loaded_session_id: None,
             oldest_loaded_msg_id: None,
+            local_session_id: None,
+            local_session_path: None,
+            local_session_meta_written: false,
+            local_session_summaries: Vec::new(),
             page_state: PageState::Idle,
             expanded_tools: HashSet::new(),
             expanded_thoughts: HashSet::new(),
@@ -473,8 +507,6 @@ impl App {
             expanded_dirs: HashSet::new(),
             sidebar_scroll: 0,
             sidebar_snapshot: None,
-            api,
-            api_tx,
             update_available: None,
             inline_popup: InlinePopup::None,
             pending_settings_msg_idx: None,

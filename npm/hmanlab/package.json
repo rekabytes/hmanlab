@@ -1,6 +1,6 @@
 {
   "name": "hmanlab",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "hmanlab — a terminal UI for chatting with Ollama, z.ai, Ollama Cloud, and OpenCode Go from your shell.",
   "keywords": [
     "ai",
@@ -35,10 +35,10 @@
     "test": "node test/smoke.js"
   },
   "optionalDependencies": {
-    "@hmanlab/linux-x64": "0.2.3",
-    "@hmanlab/linux-arm64": "0.2.3",
-    "@hmanlab/darwin-x64": "0.2.3",
-    "@hmanlab/darwin-arm64": "0.2.3",
-    "@hmanlab/win32-x64": "0.2.3"
+    "@hmanlab/linux-x64": "0.2.4",
+    "@hmanlab/linux-arm64": "0.2.4",
+    "@hmanlab/darwin-x64": "0.2.4",
+    "@hmanlab/darwin-arm64": "0.2.4",
+    "@hmanlab/win32-x64": "0.2.4"
   }
 }

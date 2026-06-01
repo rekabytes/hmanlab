@@ -1,33 +1,12 @@
 //! `/settings` and `/update`.
-//!
-//! Both commands kick a background task and edit-in-place (or append) when
-//! the result lands:
-//!
-//! - **`/settings`** drops a placeholder card synchronously (so the user
-//!   sees their local config right away), stashes its index in
-//!   `pending_settings_msg_idx`, then resolves the account block from
-//!   the auth API + the latest npm version. The stream handler in
-//!   `stream::StreamMsg::Settings` overwrites the placeholder so the
-//!   refresh looks atomic.
-//! - **`/update`** is a self-upgrade via `npm install -g hmanlab@latest`,
-//!   guarded by a cargo-install detector — if the binary lives under
-//!   `.cargo/bin` or a `target/` build dir we surface the cargo upgrade
-//!   command instead of stomping on it with npm.
 
 use tokio::sync::mpsc;
 
 use super::super::{App, StreamMsg};
 
 impl App {
-    /// `/settings` — show what the user has set: hmanlab version, active
-    /// model, Ollama host, configured BYOK providers (presence only,
-    /// never the key), workspace, plus the authenticated user's profile.
-    /// The profile + latest-version look-up run in the background — the
-    /// prompt returns instantly with the locally-known fields and the
-    /// account block fills in when the request resolves.
-    ///
-    /// Backend URL / "where this came from" is intentionally not shown —
-    /// users care about their account and configuration, not plumbing.
+    /// `/settings` — show version, active model, Ollama host, configured
+    /// BYOK providers (presence only, never the key), and workspace.
     pub(in crate::app) fn show_settings(&mut self, tx: &mpsc::UnboundedSender<StreamMsg>) {
         let current = env!("CARGO_PKG_VERSION");
         let byok: Vec<&str> = crate::config::BYOK_PROVIDERS
@@ -47,11 +26,7 @@ impl App {
             }
             _ => current.to_string(),
         };
-        // Shared header — used verbatim both for the placeholder card
-        // (rendered synchronously) and for the resolved card the spawn
-        // sends back. Keeping the local block identical means the
-        // edit-in-place looks like a true refresh.
-        let local = format!(
+        let body = format!(
             "Settings\n\
              \x20 hmanlab version  : {version_line}\n\
              \x20 model            : {model}\n\
@@ -62,78 +37,26 @@ impl App {
             host = self.client.base,
             ws = self.workspace.display(),
         );
-        self.push_info(format!("{local}\n\nAccount: loading…"));
-        // Stash the placeholder card's index so the resolved reply can
-        // overwrite it in place (see stream::StreamMsg::Settings).
-        self.pending_settings_msg_idx = Some(self.messages.len().saturating_sub(1));
-        self.status = "Loading account info…".into();
+        self.push_info(body.clone());
+        self.status = "Settings".into();
 
-        let Some(api) = self.api.clone() else {
-            // No auth client → nothing to fetch. The placeholder above is
-            // all we'll have; drop the pending index so a later /settings
-            // call doesn't try to edit it.
-            self.pending_settings_msg_idx = None;
-            return;
-        };
+        // Background version check (npm). If a newer version is found the
+        // stream handler appends an update line; if not, it's a no-op.
         let current_owned = current.to_string();
-        let local_owned = local;
         let tx = tx.clone();
+        let pending_idx = self.messages.len().saturating_sub(1);
+        self.pending_settings_msg_idx = Some(pending_idx);
+        let body_owned = body;
         tokio::spawn(async move {
-            // Fan out the three lookups in parallel — they're independent
-            // and the slowest one (npm latest) gates user-visible
-            // freshness, so serialising them would just stack network
-            // round-trips for no benefit.
-            let (me, latest, usage) = tokio::join!(
-                api.fetch_me(),
-                async { crate::update_check::fetch_latest_npm().await.ok() },
-                async { api.fetch_hosted_usage().await.ok() },
-            );
-            let account = match me {
-                Ok(me) => {
-                    let name = me.name.as_deref().unwrap_or("(no display name set)");
-                    let admin = if me.is_admin { " · admin" } else { "" };
-                    let opt = if me.training_opt_in {
-                        "opted in"
-                    } else {
-                        "opted out"
-                    };
-                    // Hosted-chat usage tucks under the account block so
-                    // the "your situation today" info clusters together.
-                    // Quietly omitted when the endpoint is unreachable
-                    // (e.g. older api server without the route) — the
-                    // user shouldn't see "(could not load)" for a side
-                    // signal that just isn't critical.
-                    let usage_line = match usage {
-                        Some(u) => format!(
-                            "\n\x20 api call         : {used}/{quota} request / day",
-                            used = u.used,
-                            quota = u.quota,
-                        ),
-                        None => String::new(),
-                    };
-                    format!(
-                        "Account\n\
-                         \x20 name             : {name}{admin}\n\
-                         \x20 email            : {email}\n\
-                         \x20 training data    : {opt}{usage_line}",
-                        email = me.email,
-                    )
-                }
-                Err(_) => "Account\n\x20 (could not load — try /settings again later)".to_string(),
-            };
+            let latest = crate::update_check::fetch_latest_npm().await.ok();
             let version_tail = match latest {
                 Some(l) if crate::update_check::newer(&current_owned, &l) => {
                     format!("\n\nnpm latest: {l} — run /update to install.")
                 }
                 Some(l) => format!("\n\nnpm latest: {l} (you're up to date)."),
-                None => String::new(),
+                None => return,
             };
-            // Send the full resolved card; the handler decides whether
-            // to edit-in-place (pending_settings_msg_idx still set) or
-            // append (e.g. user re-ran /settings in the meantime).
-            let _ = tx.send(StreamMsg::Settings(format!(
-                "{local_owned}\n\n{account}{version_tail}"
-            )));
+            let _ = tx.send(StreamMsg::Settings(format!("{body_owned}\n{version_tail}")));
         });
     }
 

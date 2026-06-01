@@ -20,59 +20,109 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 use tui_textarea::Input;
 
-use super::super::{fresh_textarea, App, AppAction, Mode, PickerEntry, StreamMsg};
+use super::super::{
+    fresh_textarea, App, AppAction, Mode, ModelPickerLevel, ModelRow, ProviderRow, StreamMsg,
+};
 
 impl App {
+    /// Build the level-1 provider list. Called each time the picker opens.
     pub(in crate::app) fn rebuild_picker_entries(&mut self) {
-        let mut entries: Vec<PickerEntry> = self
-            .models
-            .iter()
-            .map(|m| PickerEntry::Ollama(m.clone()))
-            .collect();
-        for em in &self.extra_models {
-            entries.push(PickerEntry::Extra(em.clone()));
+        let mut rows: Vec<ProviderRow> = Vec::new();
+
+        // Ollama (local) — always shown when models are available or host is set.
+        if !self.models.is_empty() {
+            rows.push(ProviderRow::Active {
+                provider: None,
+                label: "Ollama (local)".to_string(),
+                model_count: self.models.len(),
+            });
         }
-        // Each provider's "+ Add … key" row only appears while that provider
-        // is unconfigured. Once a key is saved, the corresponding models
-        // already show up in the section above via `extra_models`.
+
+        // Configured BYOK providers — one row per provider that has models.
         for provider in crate::config::BYOK_PROVIDERS {
-            if !self.has_byok_key(provider) {
-                entries.push(PickerEntry::AddProvider((*provider).to_string()));
+            if self.has_byok_key(provider) {
+                let count = self
+                    .extra_models
+                    .iter()
+                    .filter(|m| m.provider == *provider)
+                    .count();
+                rows.push(ProviderRow::Active {
+                    provider: Some((*provider).to_string()),
+                    label: crate::config::provider_label(provider).to_string(),
+                    model_count: count,
+                });
             }
         }
-        self.model_picker.set_items(entries);
-    }
 
-    pub(in crate::app) fn open_picker(&mut self) {
-        if self.models.is_empty() && self.extra_models.is_empty() {
-            self.push_info(
-                "No models yet. Connect Ollama with /host <url>, or add a BYOK model from the picker.".into(),
-            );
+        // Unconnected providers — "+ Connect" rows at the bottom.
+        for provider in crate::config::BYOK_PROVIDERS {
+            if !self.has_byok_key(provider) {
+                rows.push(ProviderRow::Add((*provider).to_string()));
+            }
         }
-        self.rebuild_picker_entries();
-        self.mode = Mode::ModelPicker;
-        // Cursor on the currently active model if it's in the list, else 0.
-        // For Extras we match BOTH provider + name so that picking the same
-        // model under a different plan (e.g. glm-4.7 on usage vs subscription)
-        // doesn't land the cursor on the wrong row.
+
+        self.model_picker.set_items(rows);
+
+        // Pre-select the row matching the current active provider.
         let active_provider = self.selected_extra.as_ref().map(|e| e.provider.as_str());
         self.model_picker.index = self
             .model_picker
             .items
             .iter()
-            .position(|e| match e {
-                PickerEntry::Ollama(n) => active_provider.is_none() && n == &self.model,
-                PickerEntry::Extra(m) => {
-                    active_provider.is_some_and(|p| p == m.provider) && m.name == self.model
-                }
-                PickerEntry::AddProvider(_) => false,
+            .position(|row| match row {
+                ProviderRow::Active { provider, .. } => match (provider, active_provider) {
+                    (None, None) => true,
+                    (Some(p), Some(ap)) => p == ap,
+                    _ => false,
+                },
+                ProviderRow::Add(_) => false,
             })
             .unwrap_or(0);
     }
 
-    /// Begin the "+ Add … key" flow for the given provider. Single step:
-    /// collect the API key. After save, all known models for that provider
-    /// become available in the picker.
+    /// Build level-2 model list for the given provider tag.
+    /// `None` = local Ollama, `Some(id)` = BYOK provider.
+    pub(in crate::app) fn rebuild_model_rows(&mut self, provider: Option<&str>) {
+        let rows: Vec<ModelRow> = match provider {
+            None => self
+                .models
+                .iter()
+                .map(|m| ModelRow::Ollama(m.clone()))
+                .collect(),
+            Some(prov) => self
+                .extra_models
+                .iter()
+                .filter(|m| m.provider == prov)
+                .map(|m| ModelRow::Extra(m.clone()))
+                .collect(),
+        };
+        self.model_picker_models.set_items(rows);
+
+        // Pre-select the active model if it's in this provider.
+        let active_provider = self.selected_extra.as_ref().map(|e| e.provider.as_str());
+        let is_active_provider = match (provider, active_provider) {
+            (None, None) => true,
+            (Some(p), Some(ap)) => p == ap,
+            _ => false,
+        };
+        if is_active_provider {
+            self.model_picker_models.index = self
+                .model_picker_models
+                .items
+                .iter()
+                .position(|r| r.name() == self.model)
+                .unwrap_or(0);
+        }
+    }
+
+    pub(in crate::app) fn open_picker(&mut self) {
+        self.rebuild_picker_entries();
+        self.model_picker_level = ModelPickerLevel::Provider;
+        self.mode = Mode::ModelPicker;
+        self.status = "↑↓ select provider  ·  Enter open  ·  Esc cancel".into();
+    }
+
+    /// Begin the "+ Connect" key-entry flow for the given provider.
     pub(in crate::app) fn begin_add_model(&mut self, provider: &str) {
         self.add_model_provider = provider.to_string();
         self.add_model_input = fresh_textarea();
@@ -91,6 +141,10 @@ impl App {
             p if p == crate::config::OPENROUTER_PROVIDER => (
                 "Paste your OpenRouter API key (from https://openrouter.ai/settings/keys)",
                 "OpenRouter",
+            ),
+            p if p == crate::config::HMANLAB_PROVIDER => (
+                "Paste your hmanlab API key (sk-… from https://ai.hmanlab.pro)",
+                "hmanlab",
             ),
             _ => ("Paste your z.ai coding-plan API key", "z.ai subscription"),
         };
@@ -116,13 +170,7 @@ impl App {
                     return AppAction::Continue;
                 }
                 let provider = self.add_model_provider.clone();
-                // Store the key first; per-provider "seed the model list"
-                // dispatch is independent and only differs in what list to
-                // seed and which default model to switch to.
                 self.set_byok_key(&provider, val);
-                // `default_model` is the model the active selection switches
-                // to after saving — chosen per-provider so the user can chat
-                // immediately without re-opening the picker.
                 let (label, default_model) = match provider.as_str() {
                     p if p == crate::config::ZAI_USAGE_PROVIDER => {
                         self.ensure_zai_models_for(&provider);
@@ -140,6 +188,10 @@ impl App {
                         self.ensure_openrouter_models();
                         ("OpenRouter", crate::config::OPENROUTER_DEFAULT_MODEL)
                     }
+                    p if p == crate::config::HMANLAB_PROVIDER => {
+                        self.ensure_hmanlab_models();
+                        ("hmanlab", crate::config::HMANLAB_DEFAULT_MODEL)
+                    }
                     _ => {
                         self.ensure_zai_models_for(&provider);
                         ("z.ai subscription", crate::config::ZAI_DEFAULT_MODEL)
@@ -156,10 +208,6 @@ impl App {
                 self.selected_extra = target_extra;
                 self.mode = Mode::Chat;
                 self.status = format!("{label} key saved · using {}", self.model);
-                // For OpenRouter, immediately try to pull the live model
-                // catalog — the static seed in OPENROUTER_MODELS is just a
-                // first-launch fallback. Silent failure is fine (network
-                // blip, no_proxy, etc.); the user keeps the seeded set.
                 if provider == crate::config::OPENROUTER_PROVIDER {
                     self.refresh_openrouter_models(tx);
                 }
@@ -210,9 +258,6 @@ impl App {
         };
         if let Some(m) = chosen {
             self.model = m;
-            // /model <name> only matches Ollama-discovered models, so clear
-            // any active extra. To switch to an extra-provider model, use
-            // the picker (Ctrl+M).
             self.selected_extra = None;
             self.push_info(format!("Switched to model: {}", self.model));
             self.status = format!("Model: {}", self.model);
@@ -244,10 +289,6 @@ impl App {
     }
 }
 
-/// Persist the user's currently-selected model so the next launch boots
-/// straight into it. `provider = None` means Ollama; otherwise it's the
-/// `ExtraModel::provider` tag. Best-effort — a write failure is logged to
-/// the chat as info but never aborts the model switch itself.
 pub(in crate::app) fn persist_last_model(
     model: &str,
     provider: Option<&str>,

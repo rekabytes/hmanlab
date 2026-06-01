@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use super::super::commands::model::persist_last_model;
-use super::super::{App, AppAction, Mode, PickerEntry, StreamMsg};
+use super::super::{App, AppAction, Mode, ModelPickerLevel, ProviderRow, StreamMsg};
 
 impl App {
     /// Key routing while the file viewer is open. Esc dismisses; arrow /
@@ -68,8 +68,6 @@ impl App {
             KeyCode::Enter => {
                 if let Some(s) = self.session_picker.selected().cloned() {
                     self.mode = Mode::Chat;
-                    // Reuse the existing load-by-prefix path: just pass the
-                    // full id so load_session resolves it cleanly.
                     self.load_session(s.id, tx);
                 }
             }
@@ -79,37 +77,74 @@ impl App {
     }
 
     pub(in crate::app) fn handle_picker(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Esc => self.mode = Mode::Chat,
-            KeyCode::Up | KeyCode::Char('k') => self.model_picker.select_prev(),
-            KeyCode::Down | KeyCode::Char('j') => self.model_picker.select_next(),
-            KeyCode::Enter => {
-                if let Some(entry) = self.model_picker.selected().cloned() {
-                    match entry {
-                        PickerEntry::Ollama(name) => {
-                            self.model = name.clone();
-                            self.selected_extra = None;
-                            self.status = format!("Switched to {}", name);
-                            self.mode = Mode::Chat;
-                            let _ = persist_last_model(&self.model, None);
-                        }
-                        PickerEntry::Extra(m) => {
-                            self.model = m.name.clone();
-                            self.status = format!("Switched to [{}] {}", m.provider, m.name);
-                            let provider = m.provider.clone();
-                            self.selected_extra = Some(m);
-                            self.mode = Mode::Chat;
-                            let _ = persist_last_model(&self.model, Some(&provider));
-                        }
-                        PickerEntry::AddProvider(provider) => {
-                            self.begin_add_model(&provider);
+        match self.model_picker_level.clone() {
+            // ── Level 1: provider list ────────────────────────────────────
+            ModelPickerLevel::Provider => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Chat;
+                    self.status = "Cancelled".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.model_picker.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.model_picker.select_next(),
+                KeyCode::Enter => {
+                    if let Some(row) = self.model_picker.selected().cloned() {
+                        match row {
+                            ProviderRow::Active { provider, .. } => {
+                                // Drill into this provider's model list.
+                                self.rebuild_model_rows(provider.as_deref());
+                                self.model_picker_level = ModelPickerLevel::Model;
+                                let label = provider
+                                    .as_deref()
+                                    .map(crate::config::provider_label)
+                                    .unwrap_or("Ollama (local)");
+                                self.status = format!(
+                                    "↑↓ select model  ·  Enter confirm  ·  Esc back  ·  {label}"
+                                );
+                            }
+                            ProviderRow::Add(provider) => {
+                                self.begin_add_model(&provider);
+                            }
                         }
                     }
-                } else {
-                    self.mode = Mode::Chat;
                 }
-            }
-            _ => {}
+                _ => {}
+            },
+            // ── Level 2: model list ───────────────────────────────────────
+            ModelPickerLevel::Model => match key.code {
+                KeyCode::Esc => {
+                    // Go back to level 1.
+                    self.model_picker_level = ModelPickerLevel::Provider;
+                    self.status = "↑↓ select provider  ·  Enter open  ·  Esc cancel".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.model_picker_models.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.model_picker_models.select_next(),
+                KeyCode::Enter => {
+                    if let Some(row) = self.model_picker_models.selected().cloned() {
+                        let name = row.name().to_string();
+                        let provider = row.provider().map(|s| s.to_string());
+                        match row {
+                            crate::app::ModelRow::Ollama(_) => {
+                                self.model = name.clone();
+                                self.selected_extra = None;
+                                self.status = format!("Switched to {name}");
+                                let _ = persist_last_model(&self.model, None);
+                            }
+                            crate::app::ModelRow::Extra(m) => {
+                                self.model = m.name.clone();
+                                self.status = format!("Switched to [{}] {}", m.provider, m.name);
+                                let prov = m.provider.clone();
+                                self.selected_extra = Some(m);
+                                let _ = persist_last_model(&self.model, Some(&prov));
+                            }
+                        }
+                        let _ = provider;
+                        self.mode = Mode::Chat;
+                    } else {
+                        self.mode = Mode::Chat;
+                    }
+                }
+                _ => {}
+            },
         }
         AppAction::Continue
     }

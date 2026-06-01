@@ -1,6 +1,6 @@
 [package]
 name = "hmanlab"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.74"
 description = "Terminal UI for chatting with local Ollama and BYOK LLM providers, with agentic tool use and persistent memory."

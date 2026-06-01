@@ -114,11 +114,6 @@ impl App {
                 } else {
                     self.follow = false;
                     self.scroll = self.scroll.saturating_sub(3);
-                    // Wheel scrolled chat upward — if we landed on the very
-                    // top and there's older history on the server, fetch
-                    // the next page automatically. Silent / debounced
-                    // inside `maybe_auto_load_more`.
-                    self.maybe_auto_load_more(tx);
                 }
             }
             MouseEventKind::ScrollDown => {

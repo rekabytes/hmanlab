@@ -218,7 +218,7 @@ impl App {
         let user_label = format!("[/ask {name}] {query}");
         self.messages.push(ChatMessage {
             role: "user".into(),
-            content: user_label.clone(),
+            content: user_label,
             ..Default::default()
         });
         self.messages.push(ChatMessage {
@@ -226,15 +226,6 @@ impl App {
             content: String::new(),
             ..Default::default()
         });
-        // Persist as a normal session message — the specialist reply
-        // will land via the usual on_done path.
-        if let Some(api_tx) = &self.api_tx {
-            let _ = api_tx.send(crate::api::ApiOp::UserMessage {
-                content: user_label,
-                model: spec.model.clone(),
-            });
-        }
-
         self.follow = true;
         self.status = format!("[/ask {name}] running on {}…", spec.model);
         self.active_specialist = Some(spec.name.clone());

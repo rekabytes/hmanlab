@@ -4,7 +4,6 @@
 
 use tokio::sync::mpsc;
 
-use crate::api::ApiOp;
 use crate::ollama::ToolCall;
 
 use super::super::{App, StreamMsg};
@@ -35,32 +34,10 @@ impl App {
     }
 
     pub(super) fn on_assistant_turn_ended(&mut self, tool_calls: Vec<ToolCall>) {
-        // Snapshot the assistant content + tool_calls before mutation,
-        // then persist this intermediate turn so future fine-tunes can
-        // see the model's tool-calling behavior, not just the final
-        // text. Without this we'd only ever capture the closing reply.
-        let snapshot: Option<(String, serde_json::Value)> =
-            if let Some(last) = self.messages.last_mut() {
-                if last.role == "assistant" && !tool_calls.is_empty() {
-                    last.tool_calls = Some(tool_calls.clone());
-                    let tc_value = serde_json::to_value(&tool_calls)
-                        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-                    Some((last.content.clone(), tc_value))
-                } else {
-                    if last.role == "assistant" {
-                        last.tool_calls = Some(tool_calls);
-                    }
-                    None
-                }
-            } else {
-                None
-            };
-        if let (Some((content, tc_value)), Some(api_tx)) = (snapshot, self.api_tx.as_ref()) {
-            let _ = api_tx.send(ApiOp::AssistantToolCalls {
-                content,
-                tool_calls: tc_value,
-                model: self.model.clone(),
-            });
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == "assistant" {
+                last.tool_calls = Some(tool_calls);
+            }
         }
     }
 

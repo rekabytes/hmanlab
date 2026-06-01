@@ -13,7 +13,6 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyEventKind};
 use tokio::sync::mpsc;
 
-use crate::api::ApiOp;
 use crate::ollama::ChatMessage;
 
 use super::commands::Command;
@@ -71,7 +70,7 @@ impl App {
             Command::New => self.new_session(),
             Command::ListSessions => self.list_sessions_inline(tx),
             Command::Load(prefix) => self.load_session(prefix, tx),
-            Command::More => self.load_more(tx),
+            Command::More => self.push_info("/more is not needed — local sessions load fully. Use /sessions and /load <prefix>.".into()),
             Command::Workspace(path) => self.switch_workspace(path),
             Command::Compact => self.start_compact(tx, None),
             Command::Disconnect(name) => self.handle_disconnect(&name),
@@ -163,11 +162,19 @@ impl App {
     /// `hidden = true` to keep the user message off the visible
     /// transcript (Y/N injections) or `false` for the normal flow.
     fn start_turn(&mut self, text: String, hidden: bool, tx: &mpsc::UnboundedSender<StreamMsg>) {
-        if let Some(api_tx) = &self.api_tx {
-            let _ = api_tx.send(ApiOp::UserMessage {
-                content: text.clone(),
-                model: self.model.clone(),
-            });
+        // Persist user message to local JSONL session (skip hidden Y/N injections).
+        if !hidden {
+            self.ensure_local_session();
+            if let (Some(sid), Some(path)) = (
+                self.local_session_id.clone(),
+                self.local_session_path.clone(),
+            ) {
+                let model = self.model.clone();
+                let content = text.clone();
+                tokio::spawn(async move {
+                    let _ = crate::session::write_user(&path, &sid, &content, &model);
+                });
+            }
         }
         // Drain any /attach-queued media onto this user turn. Attachments
         // are in-memory only (not persisted), so they ride along once and

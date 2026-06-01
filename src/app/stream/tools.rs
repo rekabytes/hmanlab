@@ -2,7 +2,6 @@
 //! starts, replacing it with the output when the tool returns, and the
 //! confirm-popup intercept (with the workspace-trust short-circuit).
 
-use crate::api::ApiOp;
 use crate::ollama::ChatMessage;
 use crate::tools;
 
@@ -22,32 +21,24 @@ impl App {
     }
 
     pub(super) fn on_tool_result(&mut self, output: String) {
-        // Walk backwards to find the most recent tool placeholder.
-        // We can't just look at `last()` because confirmed tools
-        // (run_command / edit_file / write_file) sit through the
-        // user's y/n decision — the handler for that decision calls
-        // `push_info(...)` which appends a system message between the
-        // tool placeholder and the eventual ToolResult. Trusting
-        // `last_mut()` silently drops the tool result on the floor
-        // (and from the DB, which breaks training data for any tool
-        // that requires confirmation).
-        let mut to_persist: Option<(String, String)> = None;
+        let mut tool_name: Option<String> = None;
         for msg in self.messages.iter_mut().rev() {
             if msg.role == "tool" {
                 msg.content = output.clone();
-                // NOTE: msg.diff is set earlier by handle_confirm-Y
-                // (attached to active_tool_msg_idx the moment the
-                // user approves). We DON'T overwrite it here —
-                // doing so would clobber the diff with None for
-                // tools that didn't go through confirm.
-                if let Some(n) = msg.name.clone() {
-                    to_persist = Some((n, output));
-                }
+                tool_name = msg.name.clone();
                 break;
             }
         }
-        if let (Some((name, output)), Some(api_tx)) = (to_persist, self.api_tx.as_ref()) {
-            let _ = api_tx.send(ApiOp::ToolResult { name, output });
+        // Write tool result to local session.
+        if let (Some(name), Some(sid), Some(path)) = (
+            tool_name,
+            self.local_session_id.clone(),
+            self.local_session_path.clone(),
+        ) {
+            let out = output.clone();
+            tokio::spawn(async move {
+                let _ = crate::session::write_tool(&path, &sid, &name, &out);
+            });
         }
         self.active_tool_msg_idx = None;
     }

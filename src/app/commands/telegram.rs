@@ -386,40 +386,12 @@ impl App {
         s
     }
 
-    /// Async `/sessions` for Telegram. Fetches the 10 most-recent
-    /// sessions in a tokio task and DMs the formatted list.
+    /// `/sessions` from Telegram — no longer available.
     fn telegram_cmd_sessions(&mut self, chat_id: i64) {
-        let Some(api) = self.api.clone() else {
-            self.send_telegram_dm(
-                chat_id,
-                "API is off — no persisted sessions available to list.".into(),
-            );
-            return;
-        };
-        let Some(out_tx) = self.telegram.as_ref().map(|rt| rt.out_tx.clone()) else {
-            return; // bot vanished mid-dispatch
-        };
-        tokio::spawn(async move {
-            let body = match api.list_sessions(10).await {
-                Ok(rows) if rows.is_empty() => "No saved sessions yet.".to_string(),
-                Ok(rows) => {
-                    let mut s = format!("Recent sessions ({}):\n", rows.len());
-                    for sess in rows {
-                        let id_short = &sess.id[..sess.id.len().min(8)];
-                        let title = if sess.title.trim().is_empty() {
-                            "(untitled)".to_string()
-                        } else {
-                            sess.title.clone()
-                        };
-                        let model = sess.model.unwrap_or_else(|| "-".into());
-                        s.push_str(&format!("  {id_short}  {title}  · {model}\n"));
-                    }
-                    s
-                }
-                Err(e) => format!("Couldn't list sessions: {e}"),
-            };
-            let _ = out_tx.send(crate::telegram::dm(chat_id, body));
-        });
+        self.send_telegram_dm(
+            chat_id,
+            "Session persistence is not available in this version. Use /new to start a fresh session.".into(),
+        );
     }
 
     /// Async `/settings` for Telegram. Mirrors the local `/settings`
@@ -446,40 +418,7 @@ impl App {
              \x20 BYOK        : {byok_line}\n\
              \x20 workspace   : {ws}"
         );
-        let Some(api) = self.api.clone() else {
-            // No backend? Send what we know locally and bail — no
-            // account block to fetch.
-            self.send_telegram_dm(chat_id, format!("{local}\n\nAccount: (API off)"));
-            return;
-        };
-        let Some(out_tx) = self.telegram.as_ref().map(|rt| rt.out_tx.clone()) else {
-            return;
-        };
-        tokio::spawn(async move {
-            let account = match api.fetch_me().await {
-                Ok(me) => {
-                    let name = me.name.as_deref().unwrap_or("(no display name set)");
-                    let admin = if me.is_admin { " · admin" } else { "" };
-                    let opt = if me.training_opt_in {
-                        "opted in"
-                    } else {
-                        "opted out"
-                    };
-                    format!(
-                        "Account\n\
-                         \x20 name     : {name}{admin}\n\
-                         \x20 email    : {email}\n\
-                         \x20 training : {opt}",
-                        email = me.email,
-                    )
-                }
-                Err(_) => "Account\n\x20 (could not load — try /settings again later)".to_string(),
-            };
-            let _ = out_tx.send(crate::telegram::dm(
-                chat_id,
-                format!("{local}\n\n{account}"),
-            ));
-        });
+        self.send_telegram_dm(chat_id, local);
     }
 
     /// `/agents` from Telegram — only the read + session-toggle subset.

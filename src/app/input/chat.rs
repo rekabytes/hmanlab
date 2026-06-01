@@ -168,7 +168,6 @@ impl App {
             KeyCode::PageUp => {
                 self.follow = false;
                 self.scroll = self.scroll.saturating_sub(5);
-                self.maybe_auto_load_more(tx);
                 return AppAction::Continue;
             }
             KeyCode::PageDown => {
@@ -181,7 +180,6 @@ impl App {
             KeyCode::Up if self.input.lines().len() <= 1 => {
                 self.follow = false;
                 self.scroll = self.scroll.saturating_sub(3);
-                self.maybe_auto_load_more(tx);
                 return AppAction::Continue;
             }
             KeyCode::Down if self.input.lines().len() <= 1 => {
@@ -195,9 +193,6 @@ impl App {
             KeyCode::Home => {
                 self.follow = false;
                 self.scroll = 0;
-                // Jumping to the top is a strong signal the user wants
-                // older history — fire an immediate page-load if available.
-                self.maybe_auto_load_more(tx);
                 return AppAction::Continue;
             }
             KeyCode::End => {

@@ -7,8 +7,7 @@
 use tokio::sync::oneshot;
 
 use crate::agent::SpecialistRunner;
-use crate::api::{Message, Session};
-use crate::ollama::ToolCall;
+use crate::ollama::{ChatMessage, ToolCall};
 use crate::tools;
 
 pub enum StreamMsg {
@@ -22,13 +21,15 @@ pub enum StreamMsg {
         models: Vec<String>,
         base: String,
     },
-    SessionList(Vec<Session>),
-    Loaded {
-        session: Session,
-        messages: Vec<Message>,
-    },
-    MoreLoaded {
-        messages: Vec<Message>,
+    /// Local JSONL session list loaded from disk.
+    LocalSessionList(Vec<crate::session::SessionSummary>),
+    /// A local session was loaded from disk — replace visible history.
+    LocalSessionLoaded {
+        session_id: String,
+        title: String,
+        model: Option<String>,
+        messages: Vec<ChatMessage>,
+        path: std::path::PathBuf,
     },
     /// Assistant turn just ended and produced tool calls (the assistant message
     /// content has already been streamed via `Chunk`).

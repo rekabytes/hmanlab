@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-pub const DEFAULT_API_URL: &str = "https://be-ai.senireka.my";
 pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 
 /// z.ai has two billing plans, each with its own base URL. Treated as
@@ -169,27 +168,27 @@ pub const BYOK_PROVIDERS: &[&str] = &[
     OLLAMA_CLOUD_PROVIDER,
     OPENCODE_PROVIDER,
     OPENROUTER_PROVIDER,
+    HMANLAB_PROVIDER,
 ];
 
-/// hmanlab-hosted free chat — proxied through hmanlab-api with the
-/// maintainer's upstream OpenCode key. The user's own `bai_` token
-/// (already required for session persistence) is the only credential
-/// needed; there's no separate provider key to add. NOT listed in
-/// [`BYOK_PROVIDERS`] because there's no "+ Add … key" row to render
-/// — availability is implicit in having a working hmanlab-api connection.
+/// hmanlab — OpenAI-compatible relay managed by hmanlab. Users buy
+/// access on the hmanlab web app and paste their `sk-` key into the TUI.
+/// Billing, quota, and model routing all live server-side; the TUI just
+/// sends requests like any other BYOK provider.
 ///
-/// The CLI builds an OpenAI-compatible client pointing at
-/// `<api_url>/v1/chat/completions`; the API enforces a per-day quota
-/// and a per-minute rate limit before forwarding upstream. See
-/// `hmanlab-stack/packages/api/src/routes/chat.ts` for the server side.
-pub const HMANLAB_HOSTED_PROVIDER: &str = "hmanlab-free";
-
-/// Models the hosted proxy currently exposes. Keep this in lockstep with
-/// the `MODEL_WHITELIST` in `hmanlab-stack/packages/api/src/routes/chat.ts`
-/// — the API server rejects anything not in its own list, so listing a
-/// model here that the server hasn't whitelisted will produce a 400 at
-/// runtime. Start narrow; expand as usage patterns settle.
-pub const HMANLAB_HOSTED_MODELS: &[&str] = &["deepseek-v4-flash"];
+/// Model list is fetched live from `GET /v1/models` on startup when a key
+/// is configured; the seed below is the offline fallback only.
+pub const HMANLAB_PROVIDER: &str = "hmanlab";
+pub const HMANLAB_BASE: &str = "https://ai.hmanlab.pro/v1";
+pub const HMANLAB_MODELS: &[&str] = &[
+    "claude-sonnet-4-6",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-haiku-4-5",
+    "gpt-5.5",
+    "gpt-5.4",
+];
+pub const HMANLAB_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 /// Human-readable provider name for UI display. Used by the picker's
 /// `+ Add <name> key` rows, the `/disconnect` list, and `/settings`.
@@ -202,7 +201,7 @@ pub fn provider_label(provider: &str) -> &str {
         OLLAMA_CLOUD_PROVIDER => "Ollama Cloud",
         OPENCODE_PROVIDER => "OpenCode Go",
         OPENROUTER_PROVIDER => "OpenRouter",
-        HMANLAB_HOSTED_PROVIDER => "hmanlab (free)",
+        HMANLAB_PROVIDER => "hmanlab",
         other => other,
     }
 }
@@ -302,9 +301,20 @@ impl AgentsConfig {
 /// Legacy `zai_base` from earlier versions is silently ignored (serde drops
 /// unknown fields by default). The URL is now derived per-plan from the
 /// `ZAI_*_BASE` constants.
+///
+/// Legacy `api_url` and `api_key` (`bai_` token for hmanlab-stack) are kept
+/// as `#[serde(default)]` fields so old config files continue to parse
+/// without error; the values are simply ignored at runtime.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Config {
+    // Legacy compat: parsed from old config files but never read at
+    // runtime (see doc comment above). Kept so deserialization of
+    // pre-existing configs doesn't error.
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing)]
     pub api_url: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     pub ollama_host: Option<String>,
     /// z.ai SUBSCRIPTION (coding plan) key — historically called just `zai_api_key`.
@@ -325,6 +335,10 @@ pub struct Config {
     /// Generated at https://openrouter.ai/settings/keys.
     #[serde(default)]
     pub openrouter_api_key: Option<String>,
+    /// hmanlab API key (`sk-` prefixed). Buy access on the hmanlab web
+    /// app; paste the key here to use hmanlab-served models from the TUI.
+    #[serde(default)]
+    pub hmanlab_api_key: Option<String>,
     #[serde(default)]
     pub extra_models: Vec<ExtraModel>,
     /// Absolute workspace paths the user has explicitly authorised. The
@@ -403,68 +417,23 @@ pub fn save(c: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Pre-TUI prompt run when no API key is available from flag/env/config.
+/// Pre-TUI prompt run on first launch (no providers configured yet).
 ///
-/// Flow:
-///   1. hmanlab API key (validated against `/v1/auth/me`).
-///   2. Provider menu loop — add any combination of z.ai subscription,
-///      z.ai usage-based, or a local Ollama URL. All optional.
-///
-/// Ollama is now offered alongside the BYOK providers rather than asked for
-/// up front: most users don't want to deal with localhost defaults during a
-/// fresh install, and the TUI's `/host` command can configure it later
-/// anyway. If the user skips this step entirely, `ollama_host` stays unset
-/// and the TUI falls back to `DEFAULT_OLLAMA_HOST` on startup (which is a
-/// no-op when Ollama isn't running).
-pub async fn run_setup_wizard(api_url: &str, existing_ollama: Option<&str>) -> Result<Config> {
+/// Provider selection only — no account, no `bai_` key. Offers all
+/// BYOK providers plus local Ollama. Every step is optional; pressing
+/// Enter with nothing configured drops the user straight into the TUI
+/// where they can use `/model` and `/host` later.
+pub async fn run_setup_wizard(existing_ollama: Option<&str>) -> Result<Config> {
     println!();
     println!("\x1b[1mWelcome to hmanlab.\x1b[0m");
     println!();
-    println!("The hmanlab TUI is free. You bring your own LLM — either a local");
-    println!("Ollama install, or a BYOK provider key (z.ai / Ollama Cloud / OpenCode Go).");
-    println!();
-    println!("This key authenticates the TUI to the backend that stores your chat sessions");
-    println!("so you can resume them later. It doesn't grant access to any LLM.");
-    println!("Register a free account (or sign in) at \x1b[36mhttps://hmanlab.senireka.my\x1b[0m → API keys.");
+    println!("The TUI is free — no account required. Connect a provider to start");
+    println!("chatting, or skip this wizard and add one later with /model.");
     println!();
 
-    let api_key = loop {
-        print!("Paste your hmanlab API key (bai_…): ");
-        io::stdout().flush()?;
-        let mut key = String::new();
-        io::stdin().lock().read_line(&mut key)?;
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            println!("  (empty — try again, or Ctrl-C to quit)");
-            continue;
-        }
-        if !key.starts_with("bai_") {
-            println!("  \x1b[33m!\x1b[0m hmanlab keys start with 'bai_' — that doesn't look right. Try again or Ctrl-C to quit.");
-            continue;
-        }
-        print!("  validating… ");
-        io::stdout().flush()?;
-        let c = crate::api::Client::new(api_url.to_string(), key.clone());
-        match c.check_auth().await {
-            Ok(()) => {
-                println!("\x1b[32mok\x1b[0m");
-                break key;
-            }
-            Err(e) => {
-                println!("\x1b[31mfailed\x1b[0m ({e})");
-                println!("  Double-check the key, or generate a new one at https://hmanlab.senireka.my/keys");
-            }
-        }
-    };
+    let mut cfg = Config::default();
 
-    let mut cfg = Config {
-        api_url: Some(api_url.to_string()),
-        api_key: Some(api_key),
-        ..Default::default()
-    };
-
-    println!();
-    println!("Connect a provider? (optional — skip with Enter)");
+    println!("Connect a provider? (optional — press Enter to skip)");
     loop {
         let sub_state = if cfg.zai_api_key.is_some() {
             " (configured)"
@@ -476,13 +445,37 @@ pub async fn run_setup_wizard(api_url: &str, existing_ollama: Option<&str>) -> R
         } else {
             ""
         };
+        let ollama_cloud_state = if cfg.ollama_cloud_api_key.is_some() {
+            " (configured)"
+        } else {
+            ""
+        };
+        let opencode_state = if cfg.opencode_api_key.is_some() {
+            " (configured)"
+        } else {
+            ""
+        };
+        let openrouter_state = if cfg.openrouter_api_key.is_some() {
+            " (configured)"
+        } else {
+            ""
+        };
+        let prox_state = if cfg.hmanlab_api_key.is_some() {
+            " (configured)"
+        } else {
+            ""
+        };
         let ollama_state = match &cfg.ollama_host {
             Some(h) => format!(" (configured: {h})"),
             None => String::new(),
         };
-        println!("  1) z.ai subscription   — {ZAI_SUBSCRIPTION_BASE}{sub_state}");
-        println!("  2) z.ai usage-based    — {ZAI_USAGE_BASE}{usage_state}");
-        println!("  3) local LLM (Ollama){ollama_state}");
+        println!("  1) z.ai (subscription){sub_state}");
+        println!("  2) z.ai (usage-based){usage_state}");
+        println!("  3) Ollama Cloud{ollama_cloud_state}");
+        println!("  4) OpenCode Go{opencode_state}");
+        println!("  5) OpenRouter{openrouter_state}");
+        println!("  6) hmanlab (prox){prox_state}");
+        println!("  7) local Ollama{ollama_state}");
         print!("  > ");
         io::stdout().flush()?;
         let mut choice = String::new();
@@ -493,25 +486,49 @@ pub async fn run_setup_wizard(api_url: &str, existing_ollama: Option<&str>) -> R
         }
         match choice {
             "1" => {
-                cfg.zai_api_key = prompt_zai_key("subscription")?;
+                cfg.zai_api_key = prompt_api_key("z.ai subscription")?;
                 if cfg.zai_api_key.is_some() {
                     println!("  \x1b[32m✓\x1b[0m z.ai subscription key saved.");
                 }
             }
             "2" => {
-                cfg.zai_usage_api_key = prompt_zai_key("usage-based")?;
+                cfg.zai_usage_api_key = prompt_api_key("z.ai usage-based")?;
                 if cfg.zai_usage_api_key.is_some() {
                     println!("  \x1b[32m✓\x1b[0m z.ai usage-based key saved.");
                 }
             }
             "3" => {
+                cfg.ollama_cloud_api_key = prompt_api_key("Ollama Cloud")?;
+                if cfg.ollama_cloud_api_key.is_some() {
+                    println!("  \x1b[32m✓\x1b[0m Ollama Cloud key saved.");
+                }
+            }
+            "4" => {
+                cfg.opencode_api_key = prompt_api_key("OpenCode Go")?;
+                if cfg.opencode_api_key.is_some() {
+                    println!("  \x1b[32m✓\x1b[0m OpenCode Go key saved.");
+                }
+            }
+            "5" => {
+                cfg.openrouter_api_key = prompt_api_key("OpenRouter")?;
+                if cfg.openrouter_api_key.is_some() {
+                    println!("  \x1b[32m✓\x1b[0m OpenRouter key saved.");
+                }
+            }
+            "6" => {
+                cfg.hmanlab_api_key = prompt_api_key("hmanlab (sk-…)")?;
+                if cfg.hmanlab_api_key.is_some() {
+                    println!("  \x1b[32m✓\x1b[0m hmanlab key saved.");
+                }
+            }
+            "7" => {
                 cfg.ollama_host = prompt_ollama_host(existing_ollama)?;
                 if cfg.ollama_host.is_some() {
                     println!("  \x1b[32m✓\x1b[0m Ollama URL saved.");
                 }
             }
             _ => {
-                println!("  (unknown — type 1, 2, 3, or Enter to skip)");
+                println!("  (unknown — type 1–7 or Enter to skip)");
             }
         }
         println!();
@@ -525,10 +542,10 @@ pub async fn run_setup_wizard(api_url: &str, existing_ollama: Option<&str>) -> R
     Ok(cfg)
 }
 
-/// Prompt for a z.ai API key. Returns `None` if the user submits an empty
-/// line (they decided to skip this provider after all).
-fn prompt_zai_key(label: &str) -> Result<Option<String>> {
-    print!("    Paste your z.ai {label} API key (or Enter to cancel): ");
+/// Prompt for an API key for any provider. Returns `None` if the user
+/// submits an empty line (they decided to skip this provider).
+fn prompt_api_key(label: &str) -> Result<Option<String>> {
+    print!("    Paste your {label} API key (or Enter to cancel): ");
     io::stdout().flush()?;
     let mut key = String::new();
     io::stdin().lock().read_line(&mut key)?;

@@ -543,8 +543,8 @@ func (m *Model) relayout() {
 	if m.mode == ModeChat {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpH
-		// Textarea width = total - 2 (beam) - 1 (gap after beam).
-		inputW := m.width - 2 - 1
+		// Textarea width = total - 1 (slim beam) - 1 (gap after beam).
+		inputW := m.width - 1 - 1
 		if inputW < 10 {
 			inputW = 10
 		}
@@ -612,22 +612,18 @@ func (m Model) viewChat() string {
 		Render(leftHeader + middle + rightHeader)
 
 	// ── Input area ────────────────────────────────────────────────
-	// No full border — just a thick (2-col) hibiscus left beam, then
-	// 1 col of breathing room, then the textarea. The beam is the
-	// input's only ornament; it reads as "this is where you type"
-	// without enclosing the box. While a response streams, the beam
-	// pulses between Hibiscus and HibiscusGlow on the same anim-tick
-	// cadence as the status-bar dot so the two pulse in sync.
+	// No full border — just a slim 1-col hibiscus left beam, then 1
+	// col of breathing room, then the textarea. The `▌` glyph fills
+	// only the left half of its cell, so the visible beam reads as a
+	// thin pink line — not the chunky 2-col block we had before. While
+	// a response streams, the beam pulses between Hibiscus and
+	// HibiscusGlow on the same anim-tick cadence as the status-bar
+	// dot so the two pulse in sync.
 	beamColor := theme.Hibiscus
 	if m.streaming && (m.animTick/4)%2 == 0 {
 		beamColor = theme.HibiscusGlow
 	}
-	// Solid 2-col beam: two styled spaces with hibiscus bg fill the
-	// full height of the input row when joined vertically with the
-	// textarea. Each "row" of the beam is 2 spaces wide.
-	beamRow := lipgloss.NewStyle().
-		Background(beamColor).
-		Render("  ")
+	beamRow := lipgloss.NewStyle().Foreground(beamColor).Render("▌")
 	beamCol := strings.Repeat(beamRow+"\n", m.input.Height())
 	beamCol = strings.TrimRight(beamCol, "\n")
 

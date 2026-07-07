@@ -16,6 +16,13 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Source lives under cli/ after the monorepo split — every cargo
+    # step defaults to running there. Actions like cache/upload still
+    # take paths relative to the runner root, so those have explicit
+    # `cli/` prefixes below.
+    defaults:
+      run:
+        working-directory: cli
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
@@ -30,8 +37,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+            cli/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cli/Cargo.lock') }}
 
       - name: rustfmt
         run: cargo fmt --check
@@ -75,5 +82,5 @@ jobs:
 
       - name: Run smoke test
         shell: bash
-        working-directory: npm/hmanlab
+        working-directory: cli/npm/hmanlab
         run: npm test

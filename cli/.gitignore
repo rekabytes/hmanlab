@@ -1,0 +1,12 @@
+# Rust build output
+/target
+Cargo.lock.bak
+
+# npm packaging — prebuilt binaries are produced by CI (release.yml) and
+# staged into npm/@hmanlab/*/bin/ for the publish step. They should never
+# be committed; .gitkeep keeps the empty dirs tracked.
+npm/@hmanlab/*/bin/hmanlab
+npm/@hmanlab/*/bin/hmanlab.exe
+
+# Local `scripts/npm-local.sh pack` drops tarballs here.
+/dist/

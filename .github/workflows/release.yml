@@ -24,6 +24,14 @@ jobs:
     # triggered the workflow — needs contents:write on the per-job token.
     permissions:
       contents: write
+    # Source lives under cli/ after the monorepo split. Shell steps
+    # (`run:`) default to cli/, so `cargo build`, `target/...`,
+    # `npm/...` resolve correctly. Action inputs (`with:`) take paths
+    # relative to the runner root, so those still need explicit `cli/`
+    # prefixes (see upload-artifact below).
+    defaults:
+      run:
+        working-directory: cli
     strategy:
       fail-fast: false
       matrix:
@@ -71,8 +79,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+            cli/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('cli/Cargo.lock') }}
 
       - name: Install cross (Linux only)
         if: matrix.cross
@@ -98,7 +106,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: hmanlab-${{ matrix.pkg }}
-          path: npm/@hmanlab/${{ matrix.pkg }}/bin/${{ matrix.binary }}
+          # upload-artifact resolves `path` from the runner root, NOT
+          # from `working-directory: cli` — so the cli/ prefix has to
+          # be explicit here. Same story for the asset-name below.
+          path: cli/npm/@hmanlab/${{ matrix.pkg }}/bin/${{ matrix.binary }}
           if-no-files-found: error
 
       # When the workflow was fired by a GitHub Release, also attach the
@@ -146,11 +157,13 @@ jobs:
 
       # Upload install.sh as a Release asset so the curl one-liner
       # (`curl … releases/latest/download/install.sh | sh`) works.
+      # `softprops/action-gh-release` resolves `files:` from the
+      # runner root, so the cli/ prefix is explicit.
       - name: Upload install.sh to GitHub Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
-          files: install.sh
+          files: cli/install.sh
           fail_on_unmatched_files: true
 
       - name: Set up Node
@@ -174,18 +187,18 @@ jobs:
         shell: bash
         run: |
           for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            mkdir -p "npm/@hmanlab/$pkg/bin"
-            cp "artifacts/hmanlab-$pkg/hmanlab" "npm/@hmanlab/$pkg/bin/hmanlab"
-            chmod +x "npm/@hmanlab/$pkg/bin/hmanlab"
+            mkdir -p "cli/npm/@hmanlab/$pkg/bin"
+            cp "artifacts/hmanlab-$pkg/hmanlab" "cli/npm/@hmanlab/$pkg/bin/hmanlab"
+            chmod +x "cli/npm/@hmanlab/$pkg/bin/hmanlab"
           done
-          mkdir -p "npm/@hmanlab/win32-x64/bin"
-          cp "artifacts/hmanlab-win32-x64/hmanlab.exe" "npm/@hmanlab/win32-x64/bin/hmanlab.exe"
+          mkdir -p "cli/npm/@hmanlab/win32-x64/bin"
+          cp "artifacts/hmanlab-win32-x64/hmanlab.exe" "cli/npm/@hmanlab/win32-x64/bin/hmanlab.exe"
 
       - name: Sanity-check binaries
         shell: bash
         run: |
-          ls -la npm/@hmanlab/*/bin/
-          file npm/@hmanlab/linux-x64/bin/hmanlab || true
+          ls -la cli/npm/@hmanlab/*/bin/
+          file cli/npm/@hmanlab/linux-x64/bin/hmanlab || true
 
       - name: Publish subpackages
         # No NODE_AUTH_TOKEN: this uses npm OIDC trusted publishing.
@@ -202,7 +215,7 @@ jobs:
           for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
             echo "::group::publish @hmanlab/$pkg"
             (
-              cd "npm/@hmanlab/$pkg"
+              cd "cli/npm/@hmanlab/$pkg"
               pkg_name="@hmanlab/$pkg"
               pkg_version=$(node -p "require('./package.json').version")
               if npm view "${pkg_name}@${pkg_version}" version 2>/dev/null | grep -qx "${pkg_version}"; then
@@ -229,7 +242,7 @@ jobs:
       - name: Publish umbrella
         # OIDC trusted publishing — see the subpackages step above.
         run: |
-          cd npm/hmanlab
+          cd cli/npm/hmanlab
           pkg_version=$(node -p "require('./package.json').version")
           if npm view "hmanlab@${pkg_version}" version 2>/dev/null | grep -qx "${pkg_version}"; then
             echo "✓ hmanlab@${pkg_version} already published, skipping"

@@ -94,7 +94,22 @@ func New(cfg *config.Config) Model {
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.SetHeight(3)
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	// Match the textarea's own backgrounds to the input-area wrapper
+	// (BG_CHAT) so the beam + textarea read as one continuous surface
+	// instead of two stacked boxes. The cursor line stays unstyled so
+	// there's no jarring highlight on the active row.
+	ta.FocusedStyle.Base = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FGDim)
+	ta.FocusedStyle.Text = lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FG)
+	ta.FocusedStyle.EndOfBuffer = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.BlurredStyle.Base = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.BlurredStyle.CursorLine = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.BlurredStyle.Placeholder = lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FGDim)
+	ta.BlurredStyle.Text = lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FG)
+	ta.BlurredStyle.EndOfBuffer = lipgloss.NewStyle().Background(theme.BGChat)
+	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Background(theme.BGChat)
 	ta.Focus()
 
 	vp := viewport.New(80, 20)
@@ -510,28 +525,26 @@ func (m *Model) cancelStream(markCancelled bool) {
 // relayout recomputes viewport + input dimensions after a window
 // resize. Height split (top → bottom):
 //
-//	header (1) + viewport (rest) + input (5 — border + textarea + pad)
-//	+ status (1).
+//	header (1) + viewport (rest) + input (3 — textarea only, no
+//	border) + status (1).
 //
-// The textarea's width accounts for the trailing `/help for commands`
-// hint inside the input row so the two never overlap.
+// The textarea's width accounts for the hibiscus left beam (2 cols)
+// plus 1 col of breathing room after it.
 func (m *Model) relayout() {
 	if m.width < 10 || m.height < 10 {
 		return
 	}
 	const (
 		headerH = 1
-		inputH  = 5 // top border + 3 textarea + bottom border
+		inputH  = 3 // textarea only — no border, beam lives outside
 		statusH = 1
 	)
 	vpH := m.height - headerH - inputH - statusH
 	if m.mode == ModeChat {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpH
-		// Textarea width = total - 2 (border) - 2 (left+right pad)
-		//                  - hint width - 2 (gap between textarea and hint).
-		hintW := lipgloss.Width(helpHint)
-		inputW := m.width - 2 - 2 - hintW - 2
+		// Textarea width = total - 2 (beam) - 1 (gap after beam).
+		inputW := m.width - 2 - 1
 		if inputW < 10 {
 			inputW = 10
 		}
@@ -539,10 +552,9 @@ func (m *Model) relayout() {
 	}
 }
 
-// helpHint is the right-aligned affordance inside the input area.
-// Rendered dim + italic so it reads as a hint, not a primary label.
-// Pre-computed once so relayout can measure its width without
-// re-rendering on every keystroke.
+// helpHint is the right-aligned affordance in the status bar (same
+// row as the model name). Rendered dim + italic so it reads as a hint,
+// not a primary label.
 const helpHint = "/help for commands"
 
 // refreshViewportContent re-renders the chat history and pushes it
@@ -579,8 +591,9 @@ func (m Model) View() string {
 }
 
 // viewChat renders the single-pane chat layout. Vertical stack
-// (top → bottom): hibiscus header strip · history viewport · bordered
-// input area with `/help` hint · status bar with live indicator.
+// (top → bottom): hibiscus header strip · history viewport · input
+// area with thick hibiscus left beam · status bar (model name on the
+// left, /help hint on the right, live indicator in the middle).
 func (m Model) viewChat() string {
 	// ── Header strip ──────────────────────────────────────────────
 	// Hibiscus flower mark + wordmark on the left, model name on the
@@ -593,96 +606,86 @@ func (m Model) viewChat() string {
 	modelStyle := lipgloss.NewStyle().Foreground(theme.FGDim).Italic(true)
 	leftHeader := fmt.Sprintf("%s %s", mark, wordmark)
 	rightHeader := modelStyle.Render(fmt.Sprintf("○ %s", m.model))
-	// Pad the middle with spaces so rightHeader pushes to the right
-	// edge. lipgloss.JoinHorizontal with a filler works regardless of
-	// width.
 	middle := strings.Repeat(" ", max(0, m.width-lipgloss.Width(leftHeader)-lipgloss.Width(rightHeader)))
 	header := lipgloss.NewStyle().
 		Background(theme.BGBase).
 		Render(leftHeader + middle + rightHeader)
 
 	// ── Input area ────────────────────────────────────────────────
-	// Layout inside the border:
-	//   │ ▒ <textarea>  ·  /help for commands │
-	//
-	// where ▒ is the 1-space left padding the user asked for. The
-	// textarea component owns its own rendering; we just place it
-	// alongside the hint and surround with a hibiscus-tinted border.
-	hintStyled := lipgloss.NewStyle().
-		Foreground(theme.HibiscusDim).
-		Italic(true).
-		Render(helpHint)
-
-	// gap between textarea and hint — keeps the hint from kissing the
-	// cursor when the textarea is full.
-	const gap = "  "
-	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
-		" ",               // 1-space left padding (user request)
-		m.input.View(),    // textarea (width pre-set in relayout)
-		gap,               // breathing room
-		hintStyled,        // right-aligned hint
-		" ",               // 1-space right padding (symmetry)
-	)
-	// Border color: hibiscus while the input is the focused element
-	// (always, in our single-pane layout), brighter glow while a
-	// response is streaming so the input reads as "active send target".
-	borderColor := theme.Hibiscus
-	if m.streaming {
-		// Subtle glow flicker on every other anim-tick window — reads
-		// as "alive" without being noisy. Matches the cli's
-		// anim_tick/4 pulse cadence.
-		if (m.animTick/4)%2 == 0 {
-			borderColor = theme.HibiscusGlow
-		}
+	// No full border — just a thick (2-col) hibiscus left beam, then
+	// 1 col of breathing room, then the textarea. The beam is the
+	// input's only ornament; it reads as "this is where you type"
+	// without enclosing the box. While a response streams, the beam
+	// pulses between Hibiscus and HibiscusGlow on the same anim-tick
+	// cadence as the status-bar dot so the two pulse in sync.
+	beamColor := theme.Hibiscus
+	if m.streaming && (m.animTick/4)%2 == 0 {
+		beamColor = theme.HibiscusGlow
 	}
+	// Solid 2-col beam: two styled spaces with hibiscus bg fill the
+	// full height of the input row when joined vertically with the
+	// textarea. Each "row" of the beam is 2 spaces wide.
+	beamRow := lipgloss.NewStyle().
+		Background(beamColor).
+		Render("  ")
+	beamCol := strings.Repeat(beamRow+"\n", m.input.Height())
+	beamCol = strings.TrimRight(beamCol, "\n")
+
+	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		beamCol,
+		" ",             // 1-col gap after the beam
+		m.input.View(),
+	)
 	inputBlock := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
 		Background(theme.BGChat).
-		Foreground(theme.FG).
 		Render(inputRow)
 
 	// ── Status bar ────────────────────────────────────────────────
-	// Left: hibiscus dot + connection + model. Right: streaming
-	// indicator (glowing hibiscus when generating) OR last-turn token
-	// counts when idle. Both halves are independently styled so a
-	// glance tells you the agent's state.
+	// Three sections, left → right: connection dot + provider + model
+	// · live indicator (streaming pulse or last-turn tokens) · /help
+	// hint. The hint lives here now (same row as the model name) so
+	// the input area can stay visually clean — just the beam + text.
 	var dot string
 	if m.streaming {
-		// Glowing hibiscus pulse — alternates between Hibiscus and
-		// HibiscusGlow on the same cadence as the input border so the
-		// two pulse in sync.
 		if (m.animTick/4)%2 == 0 {
 			dot = lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("●")
 		} else {
 			dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
 		}
 	} else {
-		// Idle: solid hibiscus dot, no pulse.
 		dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
 	}
 	statusLeft := fmt.Sprintf("%s ollama-cloud · %s", dot, m.model)
 
-	var statusRight string
+	var statusMid string
 	if m.streaming {
-		statusRight = lipgloss.NewStyle().
+		statusMid = lipgloss.NewStyle().
 			Foreground(theme.HibiscusGlow).
 			Italic(true).
 			Render("generating…")
-	} else if m.statusLine != "" && m.lastPromptTokens == 0 && m.lastCompletionTokens == 0 {
-		// Pre-formatted status (e.g. "cancelled" after Ctrl+C, or
-		// "ready" before the first turn). Surfaces verbatim.
-		statusRight = lipgloss.NewStyle().Foreground(theme.FGDim).Render(m.statusLine)
+	} else if m.statusLine == "cancelled" {
+		statusMid = lipgloss.NewStyle().Foreground(theme.Warning).Render("cancelled")
 	} else if m.lastPromptTokens > 0 || m.lastCompletionTokens > 0 {
-		statusRight = lipgloss.NewStyle().
+		statusMid = lipgloss.NewStyle().
 			Foreground(theme.FGDim).
 			Render(fmt.Sprintf("%d in / %d out", m.lastPromptTokens, m.lastCompletionTokens))
 	}
-	statusMid := strings.Repeat(" ", max(0, m.width-lipgloss.Width(statusLeft)-lipgloss.Width(statusRight)-2))
+
+	statusRight := lipgloss.NewStyle().
+		Foreground(theme.HibiscusDim).
+		Italic(true).
+		Render(helpHint)
+
+	// Pad between the three sections so left→mid→right layout holds at
+	// any width. Two gaps: left↔mid and mid↔right.
+	gapTotal := m.width - 2 - lipgloss.Width(statusLeft) - lipgloss.Width(statusMid) - lipgloss.Width(statusRight)
+	gapTotal = max(0, gapTotal)
+	leftGap := gapTotal / 2
+	rightGap := gapTotal - leftGap
 	statusBlock := lipgloss.NewStyle().
 		Background(theme.BGBase).
 		Foreground(theme.FG).
-		Render(" " + statusLeft + statusMid + statusRight + " ")
+		Render(" " + statusLeft + strings.Repeat(" ", leftGap) + statusMid + strings.Repeat(" ", rightGap) + statusRight + " ")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,

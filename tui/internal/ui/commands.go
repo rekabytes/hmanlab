@@ -53,7 +53,7 @@ func parseSlashCommand(line string) (cmd slashCommand, ok bool) {
 // documented here, and vice versa.
 func helpText(currentModel string) string {
 	return strings.TrimSpace(fmt.Sprintf(`
-**hmanlab tui** (v0 — walking skeleton)
+**Hibiscus** — terminal client for Ollama Cloud (v0)
 
 Connected to: **Ollama Cloud**
 Current model: %s

@@ -1,20 +1,35 @@
-// Package theme holds the Catppuccin Mocha palette the cli uses, as
-// RGB literals. Mirrors cli/src/ui/theme.rs color-for-color so the two
-// clients look identical when run side by side.
+// Package theme holds the palette for the hibiscus TUI.
+//
+// The base surfaces + role-marker colors are Catppuccin Mocha (matching
+// cli/src/ui/theme.rs) so chat content looks identical between the two
+// clients. The brand accent is **hibiscus pink** — a vibrant tropical
+// pink-red (#ff5d8f) that gives the TUI its own identity separate from
+// the cli's peach accent. Three hibiscus tones:
+//
+//   Hibiscus      #ff5d8f  — primary accent (borders, badges, wordmark)
+//   HibiscusGlow  #ff8fb1  — lighter, for "glow" emphasis (active dots)
+//   HibiscusDim   #c43658  — darker, for backgrounds / pressed states
 package theme
 
 import "github.com/charmbracelet/lipgloss"
 
-// Base palette — Catppuccin Mocha.
-//
-// Values copied from cli/src/ui/theme.rs. If a token gets tweaked on
-// the cli side, mirror it here so the two clients stay visually in sync.
+// Base palette — Catppuccin Mocha surfaces + role markers.
+// Values mirror cli/src/ui/theme.rs color-for-color so chat content
+// looks identical between the two clients.
 var (
-	Accent    = lipgloss.Color("#fab387") // peach
-	AccentDim = lipgloss.Color("#b4825f")
-	AccentAlt = lipgloss.Color("#cba6f7") // mauve
+	// Hibiscus brand accent — the TUI's identity color. Used for
+	// borders on the input box + connect modal, the "● connected"
+	// status dot, the wordmark in the header, and the streaming
+	// indicator. Three tones for visual hierarchy.
+	Hibiscus     = lipgloss.Color("#ff5d8f") // primary — vibrant tropical pink
+	HibiscusGlow = lipgloss.Color("#ff8fb1") // lighter — for glow / emphasis
+	HibiscusDim  = lipgloss.Color("#c43658") // darker — for backgrounds, "pressed"
 
-	// Role markers
+	AccentAlt = lipgloss.Color("#cba6f7") // mauve (secondary accent)
+
+	// Role markers — kept identical to the cli so chat content reads
+	// the same in both clients. These are semantic (User=green,
+	// Assistant=sky) and intentionally NOT hibiscus-tinted.
 	User      = lipgloss.Color("#a6e3a1") // green
 	Assistant = lipgloss.Color("#89dceb") // sky
 	System    = lipgloss.Color("#b4befe") // lavender
@@ -34,8 +49,8 @@ var (
 	BGInspector  = lipgloss.Color("#23243a")
 	BGInspectorH = lipgloss.Color("#3c3e54")
 
-	// Borders
-	BorderActive = Accent
+	// Borders — hibiscus when active (matches brand), dim otherwise.
+	BorderActive = Hibiscus
 	BorderIdle   = FGDimmer
 
 	// Status / diff
@@ -46,25 +61,29 @@ var (
 	DiffAdd = lipgloss.Color("#a6e3a1")
 	DiffRm  = lipgloss.Color("#f38ba8")
 
-	// Semantic
-	StateIdle      = FGDim
-	StateThinking  = AccentAlt
-	StateTooling   = Accent
+	// Semantic state colors. Tooling/Thinking now use the hibiscus
+	// brand accent so the "agent is doing something" state matches
+	// the rest of the TUI's identity.
+	StateIdle       = FGDim
+	StateThinking   = AccentAlt
+	StateTooling    = Hibiscus
 	StateCompacting = lipgloss.Color("#89b4fa")
 
 	PermissionInfo        = Warning
 	PermissionDestructive = ToolError
 
 	// Tab + todo
-	TabActive   = Accent
+	TabActive   = Hibiscus
 	TabInactive = FGDim
 	TodoPending = lipgloss.Color("#a6adc8")
-	TodoActive  = Accent
+	TodoActive  = Hibiscus
 	TodoDone    = User
 )
 
 // RoleLabelStyle returns the lipgloss style for a chat message's
-// role label. Mirrors cli/src/ui/theme.rs::role_label.
+// role label. Mirrors cli/src/ui/theme.rs::role_label — role colors
+// are NOT hibiscus-tinted, they stay semantic so chat content reads
+// the same in both clients.
 func RoleLabelStyle(role string) lipgloss.Style {
 	switch role {
 	case "user":
@@ -81,7 +100,7 @@ func RoleLabelStyle(role string) lipgloss.Style {
 }
 
 // GutterStyle is the colored vertical bar that sits under each
-// speaker label, matching cli's `▎` glyph gutter.
+// speaker label.
 func GutterStyle(role string) lipgloss.Style {
 	c := FGDimmer
 	switch role {

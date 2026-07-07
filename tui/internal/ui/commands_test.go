@@ -47,7 +47,7 @@ func TestParseSlashCommand(t *testing.T) {
 // against drift if someone adds a command but forgets the help text.
 func TestHelpTextMentionsCommands(t *testing.T) {
 	out := helpText("glm-4.7")
-	for _, want := range []string{"glm-4.7", "/help", "/clear", "/quit", "/model", "Ollama Cloud"} {
+	for _, want := range []string{"glm-4.7", "/help", "/clear", "/quit", "/model", "Ollama Cloud", "Hibiscus"} {
 		if !contains(out, want) {
 			t.Errorf("helpText missing %q in output:\n%s", want, out)
 		}

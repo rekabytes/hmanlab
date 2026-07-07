@@ -89,7 +89,7 @@ type Model struct {
 // we boot straight into ModeConnect for the first-run flow.
 func New(cfg *config.Config) Model {
 	ta := textarea.New()
-	ta.Placeholder = "Send a message…  (/help for commands)"
+	ta.Placeholder = "Send a message…"
 	ta.Prompt = ""
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
@@ -122,7 +122,7 @@ func (m *Model) bootIntoChat() {
 	m.provider = llm.NewCloudOllama(m.cfg.OllamaCloudAPIKey)
 	m.model = m.cfg.EffectiveModel()
 	m.mode = ModeChat
-	m.statusLine = fmt.Sprintf("Ollama Cloud · %s · ready", m.model)
+	m.statusLine = "ready"
 	m.history = []chatMessage{
 		infoLine(fmt.Sprintf("Connected to **Ollama Cloud** (%s). Try /help for commands.", m.model)),
 	}
@@ -222,8 +222,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.lastPromptTokens = v.promptTokens
 		m.lastCompletionTokens = v.completionTokens
-		m.statusLine = fmt.Sprintf("Ollama Cloud · %s · ready · last turn: %d in / %d out",
-			m.model, v.promptTokens, v.completionTokens)
+		m.statusLine = ""
 		m.refreshViewportContent()
 		return m, nil
 	}
@@ -348,7 +347,7 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 	})
 
 	m.followTail = true
-	m.statusLine = fmt.Sprintf("Ollama Cloud · %s · generating…", m.model)
+	m.statusLine = "" // streaming indicator is rendered separately
 	m.refreshViewportContent()
 	// Kick the polling loop. tickCmd will see m.streaming=true and
 	// drain the channel on the next tick.
@@ -504,25 +503,47 @@ func (m *Model) cancelStream(markCancelled bool) {
 			break
 		}
 	}
-	m.statusLine = fmt.Sprintf("Ollama Cloud · %s · cancelled", m.model)
+	m.statusLine = "cancelled"
 	m.refreshViewportContent()
 }
 
 // relayout recomputes viewport + input dimensions after a window
-// resize. Height split: status bar (1) + input (4) + viewport (rest).
+// resize. Height split (top → bottom):
+//
+//	header (1) + viewport (rest) + input (5 — border + textarea + pad)
+//	+ status (1).
+//
+// The textarea's width accounts for the trailing `/help for commands`
+// hint inside the input row so the two never overlap.
 func (m *Model) relayout() {
 	if m.width < 10 || m.height < 10 {
 		return
 	}
-	inputH := 4
-	statusH := 1
-	vpH := m.height - inputH - statusH
+	const (
+		headerH = 1
+		inputH  = 5 // top border + 3 textarea + bottom border
+		statusH = 1
+	)
+	vpH := m.height - headerH - inputH - statusH
 	if m.mode == ModeChat {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpH
-		m.input.SetWidth(m.width)
+		// Textarea width = total - 2 (border) - 2 (left+right pad)
+		//                  - hint width - 2 (gap between textarea and hint).
+		hintW := lipgloss.Width(helpHint)
+		inputW := m.width - 2 - 2 - hintW - 2
+		if inputW < 10 {
+			inputW = 10
+		}
+		m.input.SetWidth(inputW)
 	}
 }
+
+// helpHint is the right-aligned affordance inside the input area.
+// Rendered dim + italic so it reads as a hint, not a primary label.
+// Pre-computed once so relayout can measure its width without
+// re-rendering on every keystroke.
+const helpHint = "/help for commands"
 
 // refreshViewportContent re-renders the chat history and pushes it
 // into the viewport. Called on every state change that affects the
@@ -557,36 +578,114 @@ func (m Model) View() string {
 	return ""
 }
 
-// viewChat renders the single-pane chat layout: history viewport on
-// top, input box below, status bar at the bottom.
+// viewChat renders the single-pane chat layout. Vertical stack
+// (top → bottom): hibiscus header strip · history viewport · bordered
+// input area with `/help` hint · status bar with live indicator.
 func (m Model) viewChat() string {
-	// Animated streaming caret: blinks every 4 ticks (~480ms) to match
-	// the cli's anim_tick/4 cadence.
-	caret := " "
-	for i := len(m.history) - 1; i >= 0; i-- {
-		if m.history[i].streaming {
-			if (m.animTick/4)%2 == 0 {
-				caret = "▌"
-			}
-			break
+	// ── Header strip ──────────────────────────────────────────────
+	// Hibiscus flower mark + wordmark on the left, model name on the
+	// right. Both tinted hibiscus so the brand reads at first glance.
+	mark := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("✿")
+	wordmark := lipgloss.NewStyle().
+		Foreground(theme.Hibiscus).
+		Bold(true).
+		Render("hibiscus")
+	modelStyle := lipgloss.NewStyle().Foreground(theme.FGDim).Italic(true)
+	leftHeader := fmt.Sprintf("%s %s", mark, wordmark)
+	rightHeader := modelStyle.Render(fmt.Sprintf("○ %s", m.model))
+	// Pad the middle with spaces so rightHeader pushes to the right
+	// edge. lipgloss.JoinHorizontal with a filler works regardless of
+	// width.
+	middle := strings.Repeat(" ", max(0, m.width-lipgloss.Width(leftHeader)-lipgloss.Width(rightHeader)))
+	header := lipgloss.NewStyle().
+		Background(theme.BGBase).
+		Render(leftHeader + middle + rightHeader)
+
+	// ── Input area ────────────────────────────────────────────────
+	// Layout inside the border:
+	//   │ ▒ <textarea>  ·  /help for commands │
+	//
+	// where ▒ is the 1-space left padding the user asked for. The
+	// textarea component owns its own rendering; we just place it
+	// alongside the hint and surround with a hibiscus-tinted border.
+	hintStyled := lipgloss.NewStyle().
+		Foreground(theme.HibiscusDim).
+		Italic(true).
+		Render(helpHint)
+
+	// gap between textarea and hint — keeps the hint from kissing the
+	// cursor when the textarea is full.
+	const gap = "  "
+	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		" ",               // 1-space left padding (user request)
+		m.input.View(),    // textarea (width pre-set in relayout)
+		gap,               // breathing room
+		hintStyled,        // right-aligned hint
+		" ",               // 1-space right padding (symmetry)
+	)
+	// Border color: hibiscus while the input is the focused element
+	// (always, in our single-pane layout), brighter glow while a
+	// response is streaming so the input reads as "active send target".
+	borderColor := theme.Hibiscus
+	if m.streaming {
+		// Subtle glow flicker on every other anim-tick window — reads
+		// as "alive" without being noisy. Matches the cli's
+		// anim_tick/4 pulse cadence.
+		if (m.animTick/4)%2 == 0 {
+			borderColor = theme.HibiscusGlow
 		}
 	}
-	_ = caret // (the caret would attach to the viewport's tail; left as TODO for v0.1 polish)
-
-	// Input box style — matches cli's BG_CHAT elevated surface.
-	inputStyle := lipgloss.NewStyle().
+	inputBlock := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
 		Background(theme.BGChat).
 		Foreground(theme.FG).
-		Padding(0, 1)
-	inputBlock := inputStyle.Render(m.input.View())
+		Render(inputRow)
 
-	statusStyle := lipgloss.NewStyle().
+	// ── Status bar ────────────────────────────────────────────────
+	// Left: hibiscus dot + connection + model. Right: streaming
+	// indicator (glowing hibiscus when generating) OR last-turn token
+	// counts when idle. Both halves are independently styled so a
+	// glance tells you the agent's state.
+	var dot string
+	if m.streaming {
+		// Glowing hibiscus pulse — alternates between Hibiscus and
+		// HibiscusGlow on the same cadence as the input border so the
+		// two pulse in sync.
+		if (m.animTick/4)%2 == 0 {
+			dot = lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("●")
+		} else {
+			dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
+		}
+	} else {
+		// Idle: solid hibiscus dot, no pulse.
+		dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
+	}
+	statusLeft := fmt.Sprintf("%s ollama-cloud · %s", dot, m.model)
+
+	var statusRight string
+	if m.streaming {
+		statusRight = lipgloss.NewStyle().
+			Foreground(theme.HibiscusGlow).
+			Italic(true).
+			Render("generating…")
+	} else if m.statusLine != "" && m.lastPromptTokens == 0 && m.lastCompletionTokens == 0 {
+		// Pre-formatted status (e.g. "cancelled" after Ctrl+C, or
+		// "ready" before the first turn). Surfaces verbatim.
+		statusRight = lipgloss.NewStyle().Foreground(theme.FGDim).Render(m.statusLine)
+	} else if m.lastPromptTokens > 0 || m.lastCompletionTokens > 0 {
+		statusRight = lipgloss.NewStyle().
+			Foreground(theme.FGDim).
+			Render(fmt.Sprintf("%d in / %d out", m.lastPromptTokens, m.lastCompletionTokens))
+	}
+	statusMid := strings.Repeat(" ", max(0, m.width-lipgloss.Width(statusLeft)-lipgloss.Width(statusRight)-2))
+	statusBlock := lipgloss.NewStyle().
 		Background(theme.BGBase).
-		Foreground(theme.FGDim).
-		Padding(0, 1)
-	statusBlock := statusStyle.Render(m.statusLine)
+		Foreground(theme.FG).
+		Render(" " + statusLeft + statusMid + statusRight + " ")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
 		m.viewport.View(),
 		inputBlock,
 		statusBlock,
@@ -598,16 +697,16 @@ func (m Model) viewChat() string {
 // definitions/prompt.rs comes in v0.1 when the agent loop lands.
 func workspaceSystemPrompt() string {
 	return strings.TrimSpace(`
-You are hmanlab, a terminal-based assistant. You are running inside a
-new Go + Bubble Tea client (v0 — walking skeleton). Be concise and
+You are Hibiscus, a terminal-based assistant. You are running inside
+the new Go + Bubble Tea client (v0 — walking skeleton). Be concise and
 helpful. Tool calls are not enabled at this version; if the user asks
 for something that needs filesystem or shell access, explain what you
 would do and suggest they run the Rust client (cli/) for now.
 `)
 }
 
-// min returns the smaller of a or b. (Go 1.21 has this as a builtin
-// but we keep the helper for clarity at call sites.)
+// min returns the smaller of a or b. (Go 1.21+ has this as a builtin
+// but kept here for explicitness at call sites.)
 func min(a, b int) int {
 	if a < b {
 		return a

@@ -38,7 +38,7 @@ const (
 func newConnectModal() connectModal {
 	ti := textinput.New()
 	ti.Placeholder = "Paste your Ollama Cloud API key"
-	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(theme.FGDim)
+	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(theme.HibiscusDim)
 	ti.Prompt = ""
 	ti.EchoMode = textinput.EchoNormal // cloud keys aren't secret-secret; show them so the user can verify they pasted right
 	ti.Focus()
@@ -99,7 +99,9 @@ func (m connectModal) Update(msg tea.Msg, width, height int) (connectModal, tea.
 	return m, cmd, false
 }
 
-// View renders the modal as a centered card with a border + title.
+// View renders the modal as a centered card with a hibiscus border +
+// glowing title. The card sits over a dimmed backdrop so it reads as
+// an overlay rather than another panel.
 func (m connectModal) View(width, height int) string {
 	// Card sizing — fits inside any reasonable terminal, scales down
 	// on narrow terms.
@@ -111,14 +113,23 @@ func (m connectModal) View(width, height int) string {
 		cardW = 30
 	}
 
-	title := " Connect to Ollama Cloud "
+	// Title: "✿ Connect to Ollama Cloud" — hibiscus flower mark in
+	// the glow tone, the rest in primary hibiscus. Reads as the
+	// brand's invitation to sign in.
+	mark := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("✿")
+	titleText := lipgloss.NewStyle().
+		Foreground(theme.Hibiscus).
+		Bold(true).
+		Render(" Connect to Ollama Cloud ")
+	title := mark + titleText + mark
+
 	intro := "Stream from " + config.OllamaCloudBase
-	hint := "Get a key at: https://ollama.com"
+	hint := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("Get a key at: https://ollama.com")
 
 	var actionLine string
 	switch m.state {
 	case connectValidating:
-		actionLine = lipgloss.NewStyle().Foreground(theme.Accent).Render("validating…")
+		actionLine = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("● validating…")
 	case connectSuccess:
 		actionLine = lipgloss.NewStyle().Foreground(theme.Success).Render("✓ connected")
 	default:
@@ -132,17 +143,19 @@ func (m connectModal) View(width, height int) string {
 		errLine = lipgloss.NewStyle().Foreground(theme.Error).Render("✕ " + m.errMsg)
 	}
 
+	// Hibiscus-tinted border. Rounded corners + the brand color make
+	// the modal read as the entry point to the hibiscus TUI.
 	cardStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
+		BorderForeground(theme.Hibiscus).
 		Padding(1, 2).
 		Width(cardW)
 
 	body := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Bold(true).Foreground(theme.Accent).Render(title),
+		title,
 		"",
 		lipgloss.NewStyle().Foreground(theme.FG).Render(intro),
-		lipgloss.NewStyle().Foreground(theme.FGDim).Render(hint),
+		hint,
 		"",
 		"API key: "+m.input.View(),
 		"",
@@ -151,7 +164,8 @@ func (m connectModal) View(width, height int) string {
 	)
 	card := cardStyle.Render(strings.TrimRight(body, "\n"))
 
-	// Center on the available area.
+	// Center on the available area. Backdrop is the deepest bg so the
+	// modal pops visually.
 	return lipgloss.Place(width, height,
 		lipgloss.Center, lipgloss.Center,
 		card,

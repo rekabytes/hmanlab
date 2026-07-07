@@ -16,6 +16,7 @@ mod attach;
 mod disconnect;
 mod help;
 mod host;
+pub(super) mod mcp;
 pub(super) mod model;
 mod session;
 mod settings;
@@ -25,7 +26,6 @@ pub(super) mod telegram;
 /// `App::handle_command` in `event.rs`.
 pub(super) enum Command {
     Model(Option<String>),
-    ListModels,
     Clear,
     Quit,
     Help,
@@ -67,6 +67,11 @@ pub(super) enum Command {
     /// exists as an explicit fallback for terminals that swallow
     /// Ctrl+V before the app sees it.
     Paste,
+    /// `/mcp` — open the MCP web search provider setup modal.
+    /// Lets the user pick a search provider (Brave, Exa, Tavily, Parallel)
+    /// and enter their API key. Once configured, `web_search` and
+    /// `web_fetch` tools are added to the model's tool surface.
+    Mcp,
     Unknown(String),
 }
 
@@ -141,7 +146,6 @@ pub(super) fn parse_command(text: &str) -> Option<Command> {
     let canonical = super::inline::slash_canonical(&head);
     Some(match canonical {
         Some("model") => Command::Model(if rest.is_empty() { None } else { Some(rest) }),
-        Some("models") => Command::ListModels,
         Some("clear") => Command::Clear,
         Some("quit") => Command::Quit,
         Some("help") => Command::Help,
@@ -163,6 +167,7 @@ pub(super) fn parse_command(text: &str) -> Option<Command> {
         Some("attach") => Command::Attach(rest),
         Some("detach") => Command::Detach(rest),
         Some("paste") => Command::Paste,
+        Some("mcp") => Command::Mcp,
         Some(_) | None => Command::Unknown(head.to_ascii_lowercase()),
     })
 }

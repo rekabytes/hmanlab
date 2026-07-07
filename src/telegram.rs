@@ -176,15 +176,15 @@ pub struct BotCommand {
 pub const PUBLISHED_COMMANDS: &[BotCommand] = &[
     BotCommand {
         command: "help",
-        description: "list the commands hmanlab accepts via Telegram",
+        description: "list the commands Hibiscus accepts via Telegram",
     },
     BotCommand {
         command: "sessions",
-        description: "show recent saved hmanlab sessions",
+        description: "show recent saved Hibiscus sessions",
     },
     BotCommand {
         command: "new",
-        description: "start a fresh hmanlab session",
+        description: "start a fresh Hibiscus session",
     },
     BotCommand {
         command: "models",
@@ -687,7 +687,7 @@ async fn handle_incoming(
 
     let body = format!(
         "Pairing code: {code}\n\n\
-         In your hmanlab terminal, run:\n\
+         In your Hibiscus terminal, run:\n\
          /telegram pair {code}\n\n\
          The code expires in 10 minutes."
     );

@@ -75,12 +75,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "open model picker or switch (partial match works)",
     },
     SlashCommand {
-        name: "models",
-        aliases: &["ls"],
-        args: "",
-        desc: "list available models",
-    },
-    SlashCommand {
         name: "host",
         aliases: &["connect"],
         args: "<url>",
@@ -163,6 +157,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         args: "",
         desc: "paste clipboard — image attaches, text inserts (same as Ctrl+V)",
+    },
+    SlashCommand {
+        name: "mcp",
+        aliases: &["search", "websearch"],
+        args: "",
+        desc: "configure web search provider (Brave, Exa, Tavily, Parallel)",
     },
     SlashCommand {
         name: "update",

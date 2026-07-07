@@ -30,6 +30,7 @@ similar = "2"
 mime_guess = "2"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 png = "0.17"
+html2text = "0.12"
 
 [profile.release]
 lto = "thin"

@@ -21,24 +21,13 @@ impl App {
         m: MouseEvent,
         tx: &mpsc::UnboundedSender<StreamMsg>,
     ) {
-        // Confirm mode runs its own minimal mouse handler — wheel only,
-        // scrolls the diff body the same way the keyboard arrows do.
-        // The rest of the chat-mouse logic (selection, sidebar clicks,
-        // tool toggle) would be meaningless behind a modal popup, so
-        // we early-return here without going through the chat path.
-        if self.mode == Mode::Confirm {
-            match m.kind {
-                MouseEventKind::ScrollUp => {
-                    self.confirm_scroll = self.confirm_scroll.saturating_sub(3);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.confirm_scroll = self.confirm_scroll.saturating_add(3);
-                }
-                _ => {}
-            }
-            return;
-        }
-        if self.mode != Mode::Chat {
+        // Confirm mode is now an inline card in the chat (not a popup),
+        // so the click-on-button path runs through the normal chat click
+        // handler below — see the `permission_btn_*` rect checks in the
+        // Down branch. We no longer early-return here. The keyboard path
+        // (handle_confirm) is still routed through `Mode::Confirm` for
+        // y/n/Esc.
+        if self.mode != Mode::Chat && self.mode != Mode::Confirm {
             return;
         }
         // Status-bar shell indicator. Bounded rect is populated by
@@ -47,6 +36,24 @@ impl App {
         // monitor and short-circuit before the chat-area hit-tests so
         // the click doesn't also try to toggle a tool tile.
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            // Sidebar tab clicks (Sessions / Agents) — hit-test before the
+            // wider sidebar panel check below so a click on a tab
+            // doesn't also try to interact with content at the same y.
+            // Index 0 = Sessions, 1 = Agents (Files tab was removed).
+            for (i, (rx, ry, rw, rh)) in self.render.sidebar_tab_rects.iter().enumerate() {
+                if self.point_in_rect(m.column, m.row, *rx, *ry, *rw, *rh) {
+                    let tab = match i {
+                        0 => crate::app::state::SidebarTab::Sessions,
+                        1 => crate::app::state::SidebarTab::Agents,
+                        _ => continue,
+                    };
+                    self.active_sidebar_tab = tab;
+                    self.sel_start = None;
+                    self.sel_end = None;
+                    self.selecting = false;
+                    return;
+                }
+            }
             let in_indicator = self.render.shell_indicator_w > 0
                 && m.row == self.render.shell_indicator_y
                 && m.column >= self.render.shell_indicator_x
@@ -63,6 +70,31 @@ impl App {
                 self.sel_end = None;
                 self.selecting = false;
                 return;
+            }
+            // Permission card buttons. The card lives inline in the chat,
+            // so the hit-test rects are screen-absolute — no need to
+            // translate through chat scroll state. Resolving immediately
+            // (on Down, not Up) feels snappier than waiting for the click
+            // release — there's no drag ambiguity for a button.
+            if self.pending_confirm.is_some() {
+                if let Some((bx, by, bw, bh)) = self.render.permission_btn_approve {
+                    if self.point_in_rect(m.column, m.row, bx, by, bw, bh) {
+                        self.resolve_confirm(true);
+                        self.sel_start = None;
+                        self.sel_end = None;
+                        self.selecting = false;
+                        return;
+                    }
+                }
+                if let Some((bx, by, bw, bh)) = self.render.permission_btn_deny {
+                    if self.point_in_rect(m.column, m.row, bx, by, bw, bh) {
+                        self.resolve_confirm(false);
+                        self.sel_start = None;
+                        self.sel_end = None;
+                        self.selecting = false;
+                        return;
+                    }
+                }
             }
         }
         // Track cursor position on every mouse event so the hover overlay
@@ -85,18 +117,15 @@ impl App {
                     return;
                 }
                 self.selecting = false;
-                // No drag → treat as a click. Sidebar clicks open files;
-                // chat clicks toggle the tool block under the cursor.
+                // No drag → treat as a click. Sidebar clicks open files.
+                // Chat clicks on a collapsed tool tile toggle its
+                // expand state — see App::expanded_tools.
                 if self.sel_start == self.sel_end {
                     if let Some((col, row)) = self.sel_start {
                         if self.point_in_sidebar(col, row) {
                             self.try_open_sidebar_at(row, tx);
-                        } else {
-                            let in_chat_col = col >= self.render.chat_x
-                                && col < self.render.chat_x.saturating_add(self.render.chat_w);
-                            if in_chat_col && self.open_file.is_none() {
-                                self.try_toggle_tool_at(row);
-                            }
+                        } else if self.try_toggle_tool_tile_at(col, row) {
+                            // Tile click handled — nothing else to do.
                         }
                     }
                     self.sel_start = None;
@@ -144,6 +173,14 @@ impl App {
             && row < self.render.sidebar_y.saturating_add(self.render.sidebar_h)
     }
 
+    /// Hit-test a free-standing screen rect `(x, y, w, h)` against a
+    /// cursor `(col, row)`. Used by the permission-card Approve/Deny
+    /// buttons, which the chat renderer hands us as absolute screen
+    /// rects.
+    fn point_in_rect(&self, col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
+        col >= x && col < x.saturating_add(w) && row >= y && row < y.saturating_add(h)
+    }
+
     /// Resolve a sidebar click: directories toggle expanded state, files
     /// open in the viewer. `screen_y` is the raw row from the mouse event;
     /// we convert it to a logical line via `(screen_y - sidebar_y) +
@@ -180,26 +217,70 @@ impl App {
         }
     }
 
-    fn try_toggle_tool_at(&mut self, screen_y: u16) {
-        let top = self.render.chat_y;
-        let bottom = top.saturating_add(self.render.chat_h);
-        if screen_y < top || screen_y >= bottom {
-            return;
+    /// Resolve a click on a collapsed/expanded tool tile in the chat.
+    /// Returns `true` if the click landed on a tile (so the caller
+    /// knows to skip any other chat hit-tests). Hit-test uses the
+    /// absolute screen `row` against `app.render.card_row_targets`,
+    /// which the chat renderer populated with the same coordinates
+    /// this frame — so scroll state is already accounted for.
+    ///
+    /// Two toggle targets, dispatched by `multi_group_starts`:
+    ///
+    ///   - If the registered idx is a multi-tool group's start, toggle
+    ///     `expanded_tool_groups` — this is the click that collapses a
+    ///     `◰×3 read 3 files` tile to its expanded form (or collapses
+    ///     an expanded `▼ 3 read files expanded` header back to the
+    ///     tile).
+    ///   - Otherwise, toggle `expanded_tools` for that individual
+    ///     tile's body (the legacy single-tool expand path).
+    fn try_toggle_tool_tile_at(&mut self, col: u16, row: u16) -> bool {
+        // Reject clicks outside the chat inner area — the sidebar and
+        // permission cards each have their own hit-test paths that ran
+        // before this. The card_row_targets coords are absolute screen
+        // rows already, but we still need to gate on `col` so a click
+        // on the gutter or sidebar edge doesn't accidentally match a
+        // tile row that happens to share the same y.
+        if self.render.chat_w == 0 || col < self.render.chat_x {
+            return false;
         }
-        let logical_y = self.scroll.saturating_add(screen_y - top);
-        for &(idx, ls, le) in &self.render.message_line_ranges {
-            if logical_y >= ls && logical_y < le {
-                if let Some(msg) = self.messages.get(idx) {
-                    if msg.role == "tool" && !self.expanded_tools.remove(&idx) {
+        let chat_x_max = self
+            .render
+            .chat_x
+            .saturating_add(self.render.chat_w);
+        if col >= chat_x_max {
+            return false;
+        }
+        let hit = self
+            .render
+            .card_row_targets
+            .iter()
+            .find(|(abs_y, _)| *abs_y == row)
+            .map(|(_, idx)| *idx);
+        let Some(idx) = hit else { return false };
+        // Only toggle if `idx` is still a tool message — defensive in
+        // case the message list changed between render and click.
+        if let Some(msg) = self.messages.get(idx) {
+            if msg.role == "tool" {
+                if self.render.multi_group_starts.contains(&idx) {
+                    // Multi-tool group affordance — toggles group-level
+                    // expansion (reveals every member's tile + body).
+                    if !self.expanded_tool_groups.remove(&idx) {
+                        self.expanded_tool_groups.insert(idx);
+                    }
+                } else {
+                    // Single-tile body expand (legacy path).
+                    if !self.expanded_tools.remove(&idx) {
                         self.expanded_tools.insert(idx);
                     }
                 }
-                return;
+                self.follow = false;
+                return true;
             }
         }
+        false
     }
 
-    fn copy_selection_to_clipboard(&mut self) {
+        fn copy_selection_to_clipboard(&mut self) {
         let (Some(start), Some(end)) = (self.sel_start, self.sel_end) else {
             return;
         };

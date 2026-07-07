@@ -57,6 +57,21 @@ impl App {
         tx: &mpsc::UnboundedSender<StreamMsg>,
     ) {
         self.persist_assistant_if_any();
+        // After the assistant's final text is settled, scan it for a
+        // markdown checklist and lift it into `app.plan` for the
+        // inspector pane. Empty plans stay empty (and the inspector
+        // shows the "no plan yet" hint). Only replaces the plan when
+        // one was found — if the assistant skipped the checklist this
+        // turn, leave any prior plan alone so the user can still see
+        // where they were.
+        if let Some(last) = self.messages.last() {
+            if last.role == "assistant" {
+                let parsed = crate::app::plan::parse_plan(&last.content);
+                if !parsed.is_empty() {
+                    self.plan = parsed;
+                }
+            }
+        }
         self.total_prompt_tokens = self
             .total_prompt_tokens
             .saturating_add(prompt_tokens as u64);
@@ -228,7 +243,7 @@ impl App {
         }
 
         let header = format!(
-            "🔔 hmanlab finished a turn while you were away ({}s idle).",
+            "🔔 Hibiscus finished a turn while you were away ({}s idle).",
             idle.as_secs()
         );
         // Same conversion as the bridge reply — render markdown as

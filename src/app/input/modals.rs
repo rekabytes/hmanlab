@@ -179,61 +179,10 @@ impl App {
                 return AppAction::Continue;
             }
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if let Some(req) = self.pending_confirm.take() {
-                    // Attach the authorised diff DIRECTLY to the running
-                    // tool placeholder right now — `active_tool_msg_idx`
-                    // already points at it. Attaching here means the diff
-                    // is in place before the file even gets written, so
-                    // click-to-expand on the finished tool row always
-                    // shows the diff. Empty-diff tools (run_command etc.)
-                    // skip the attach.
-                    if !req.diff.is_empty() {
-                        if let Some(idx) = self.active_tool_msg_idx {
-                            if let Some(msg) = self.messages.get_mut(idx) {
-                                msg.diff = Some(req.diff.clone());
-                            }
-                        }
-                    }
-                    let _ = req.responder.send(true);
-                    // Memory ops already render a tight `memory · save …`
-                    // tile + a result row — adding a third `✓ Allowed:`
-                    // info line just for them is noise. Other tools
-                    // (write_file / edit_file / run_command) still get
-                    // the line so the user can see what they greenlit.
-                    let is_memory_op = req.prompt.starts_with("SAVE memory")
-                        || req.prompt.starts_with("UPDATE memory")
-                        || req.prompt.starts_with("FORGET memory");
-                    if !is_memory_op {
-                        self.push_info(format!("✓ Allowed: {}", req.prompt));
-                    }
-                    // If we'd also DM'd this prompt to Telegram, overwrite
-                    // the original message there so the buttons no longer
-                    // look actionable.
-                    if let Some(ctx) = self.pending_telegram_confirm.take() {
-                        let body = format!("✓ Allowed locally by the hmanlab user: {}", req.prompt);
-                        if let Some(message_id) = ctx.message_id {
-                            self.edit_telegram_message(ctx.chat_id, message_id, body);
-                        } else {
-                            self.send_telegram_dm(ctx.chat_id, body);
-                        }
-                    }
-                }
-                self.mode = Mode::Chat;
+                self.resolve_confirm(true);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                if let Some(req) = self.pending_confirm.take() {
-                    let _ = req.responder.send(false);
-                    self.push_info(format!("✗ Denied: {}", req.prompt));
-                    if let Some(ctx) = self.pending_telegram_confirm.take() {
-                        let body = format!("✗ Denied locally by the hmanlab user: {}", req.prompt);
-                        if let Some(message_id) = ctx.message_id {
-                            self.edit_telegram_message(ctx.chat_id, message_id, body);
-                        } else {
-                            self.send_telegram_dm(ctx.chat_id, body);
-                        }
-                    }
-                }
-                self.mode = Mode::Chat;
+                self.resolve_confirm(false);
             }
             _ => {}
         }
@@ -302,6 +251,125 @@ impl App {
                 }
             }
             _ => {}
+        }
+        AppAction::Continue
+    }
+
+    /// Key routing for the `/mcp` web-search provider setup modal.
+    ///
+    /// Screen 1 (ProviderList): ↑↓/j/k navigate, Enter advances, Esc exits.
+    /// Screen 2 (KeyInput):     printable chars feed the textarea, Enter saves,
+    ///                          Ctrl+D clears the stored key, Esc goes back.
+    /// Screen 3 (Confirmed):    any Enter or Esc returns to Chat.
+    pub(in crate::app) fn handle_mcp_setup_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &mpsc::UnboundedSender<StreamMsg>,
+    ) -> AppAction {
+        use crate::app::mcp_providers::MCP_PROVIDERS;
+        use crate::app::state::McpSetupScreen;
+
+        match self.mcp_setup_screen {
+            // ── Screen 1: provider list ──────────────────────────────────
+            McpSetupScreen::ProviderList => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Chat;
+                    self.status = "Cancelled".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.mcp_setup_index > 0 {
+                        self.mcp_setup_index -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.mcp_setup_index + 1 < MCP_PROVIDERS.len() {
+                        self.mcp_setup_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let provider = &MCP_PROVIDERS[self.mcp_setup_index];
+                    if provider.needs_key {
+                        // Pre-fill input with existing key if there is one.
+                        let existing = self
+                            .mcp_keys
+                            .get(provider.id)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.mcp_setup_input = crate::app::fresh_textarea();
+                        if !existing.is_empty() {
+                            self.mcp_setup_input.insert_str(&existing);
+                        }
+                        self.mcp_setup_error = None;
+                        self.mcp_setup_screen = McpSetupScreen::KeyInput;
+                    } else {
+                        // Key-free providers (Exa basic, Parallel) activate immediately.
+                        self.mcp_active_provider = Some(provider.id.to_string());
+                        self.persist_mcp_config(tx);
+                        self.mcp_setup_screen = McpSetupScreen::Confirmed;
+                        self.status = format!("web_search active: {}", provider.label);
+                    }
+                }
+                _ => {}
+            },
+
+            // ── Screen 2: API key input ──────────────────────────────────
+            McpSetupScreen::KeyInput => {
+                // Clear inline error on any keypress.
+                self.mcp_setup_error = None;
+
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mcp_setup_screen = McpSetupScreen::ProviderList;
+                    }
+                    // Ctrl+D: remove stored key for this provider.
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let id = MCP_PROVIDERS[self.mcp_setup_index].id;
+                        self.mcp_keys.remove(id);
+                        // If this was the active provider, deactivate.
+                        if self.mcp_active_provider.as_deref() == Some(id) {
+                            self.mcp_active_provider = None;
+                        }
+                        self.persist_mcp_config(tx);
+                        self.mcp_setup_input = crate::app::fresh_textarea();
+                        self.mcp_setup_screen = McpSetupScreen::ProviderList;
+                        self.status = "API key cleared".into();
+                    }
+                    KeyCode::Enter => {
+                        let key_text = self
+                            .mcp_setup_input
+                            .lines()
+                            .first()
+                            .cloned()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if key_text.is_empty() {
+                            self.mcp_setup_error =
+                                Some("API key cannot be empty.".into());
+                        } else {
+                            let id = MCP_PROVIDERS[self.mcp_setup_index].id;
+                            let label = MCP_PROVIDERS[self.mcp_setup_index].label;
+                            self.mcp_keys.insert(id.to_string(), key_text);
+                            self.mcp_active_provider = Some(id.to_string());
+                            self.persist_mcp_config(tx);
+                            self.mcp_setup_screen = McpSetupScreen::Confirmed;
+                            self.status = format!("web_search active: {label}");
+                        }
+                    }
+                    _ => {
+                        // All other keys are forwarded to the textarea.
+                        self.mcp_setup_input.input(key);
+                    }
+                }
+            }
+
+            // ── Screen 3: confirmation ───────────────────────────────────
+            McpSetupScreen::Confirmed => match key.code {
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.mode = Mode::Chat;
+                }
+                _ => {}
+            },
         }
         AppAction::Continue
     }

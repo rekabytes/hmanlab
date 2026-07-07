@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, List, ListItem},
+    widgets::{Block, Clear, List, ListItem},
     Frame,
 };
 
@@ -93,7 +93,26 @@ pub(in crate::ui) fn render_inline_popup(f: &mut Frame, input_area: Rect, app: &
         ),
         Span::raw(" "),
     ]);
-    let block = theme::popup_block(title, false).title_bottom(footer_title);
+    // Custom block — light grey border (instead of the mauve
+    // `popup_block` accent) so the inline autocomplete doesn't fight
+    // with the input box. Title color stays peach so the
+    // "slash commands" / "workspace files" label still pops.
+    // Solid `BG_BASE` fill so the panel blends with the chat column
+    // behind it (without it, the `Clear` widget would leave the
+    // panel area in the terminal's default bg, showing as a visible
+    // rectangle against the chat's `BG_BASE` fill).
+    let block = Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(theme::color::FG_DIMMER))
+        .style(Style::default().bg(theme::color::BG_BASE))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(theme::color::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(footer_title);
 
     let max_name_w: usize = rows
         .iter()
@@ -106,12 +125,21 @@ pub(in crate::ui) fn render_inline_popup(f: &mut Frame, input_area: Rect, app: &
         .take(max_rows as usize)
         .map(|(name, desc, selected)| {
             let style = if selected {
+                // Selected row keeps the high-contrast black-on-peach
+                // pill so the cursor lands on the active choice at a
+                // glance.
                 Style::default()
                     .fg(ratatui::style::Color::Black)
                     .bg(theme::color::ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::color::FG)
+                // Slash command names are rendered in the peach accent
+                // (same orange the brand badge + selected pill use) so
+                // the eye catches them as "this is a command" without
+                // needing a hover effect.
+                Style::default()
+                    .fg(theme::color::ACCENT)
+                    .add_modifier(Modifier::BOLD)
             };
             let mut spans = vec![Span::styled(
                 format!(" {:<w$}", name, w = max_name_w),

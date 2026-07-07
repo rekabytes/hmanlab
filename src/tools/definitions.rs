@@ -17,6 +17,7 @@ mod prompt;
 mod read;
 mod shell;
 mod specialist;
+mod websearch;
 
 use crate::agent::SpecialistRunner;
 use crate::ollama::Tool;
@@ -42,8 +43,15 @@ pub fn tool_definitions() -> Vec<Tool> {
 /// the model never sees a tool it can't call. The description embeds
 /// the per-specialist `task` lines so the main model knows when each
 /// route makes sense.
-pub fn tool_definitions_with(specialists: &[SpecialistRunner]) -> Vec<Tool> {
+///
+/// `active_mcp` — when `Some(provider_id)`, the `web_search` and
+/// `web_fetch` tools are appended so the model can search the web.
+/// `None` omits them entirely (provider not configured).
+pub fn tool_definitions_with(specialists: &[SpecialistRunner], active_mcp: Option<&str>) -> Vec<Tool> {
     let mut defs = tool_definitions();
+    if active_mcp.is_some() {
+        defs.extend(websearch::websearch_tools());
+    }
     if !specialists.is_empty() {
         defs.push(specialist::consult_specialist_tool(specialists));
     }
@@ -74,7 +82,7 @@ mod tests {
     fn empty_specialists_omits_consult_tool() {
         // No runners → no `consult_specialist` registration. The main
         // model never sees a tool it can't actually use.
-        let defs = tool_definitions_with(&[]);
+        let defs = tool_definitions_with(&[], None);
         assert!(!has_tool(&defs, "consult_specialist"));
         // Sanity: the standard tools are still there.
         assert!(has_tool(&defs, "read_file"));
@@ -87,7 +95,7 @@ mod tests {
             dummy_runner("coder", "use when writing code"),
             dummy_runner("reviewer", "use when reviewing changes"),
         ];
-        let defs = tool_definitions_with(&runners);
+        let defs = tool_definitions_with(&runners, None);
         assert!(has_tool(&defs, "consult_specialist"));
         // The standard tools are still there too.
         assert!(has_tool(&defs, "read_file"));
@@ -101,7 +109,7 @@ mod tests {
             dummy_runner("coder", "use when writing code"),
             dummy_runner("reviewer", "use when reviewing"),
         ];
-        let defs = tool_definitions_with(&runners);
+        let defs = tool_definitions_with(&runners, None);
         let consult = defs
             .iter()
             .find(|t| t.function.name == "consult_specialist")

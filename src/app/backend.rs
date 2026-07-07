@@ -6,10 +6,11 @@
 use tokio::sync::mpsc;
 
 use crate::config::{
-    ExtraModel, HMANLAB_BASE, HMANLAB_MODELS, HMANLAB_PROVIDER, OLLAMA_CLOUD_BASE,
-    OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_PROVIDER, OPENCODE_BASE, OPENCODE_MODELS, OPENCODE_PROVIDER,
-    OPENROUTER_BASE, OPENROUTER_MODELS, OPENROUTER_PROVIDER, OPENROUTER_VENDORS, ZAI_MODELS,
-    ZAI_SUBSCRIPTION_BASE, ZAI_SUBSCRIPTION_PROVIDER, ZAI_USAGE_BASE, ZAI_USAGE_PROVIDER,
+    ExtraModel, HMANLAB_BASE, HMANLAB_MODELS, HMANLAB_PROVIDER, MINIMAX_BASE, MINIMAX_MODELS,
+    MINIMAX_PROVIDER, OLLAMA_CLOUD_BASE, OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_PROVIDER, OPENCODE_BASE,
+    OPENCODE_MODELS, OPENCODE_PROVIDER, OPENROUTER_BASE, OPENROUTER_MODELS, OPENROUTER_PROVIDER,
+    OPENROUTER_VENDORS, ZAI_MODELS, ZAI_SUBSCRIPTION_BASE, ZAI_SUBSCRIPTION_PROVIDER,
+    ZAI_USAGE_BASE, ZAI_USAGE_PROVIDER,
 };
 use crate::ollama::Client;
 use crate::openai_compat;
@@ -35,6 +36,7 @@ impl App {
             Some(OPENCODE_PROVIDER) => OPENCODE_BASE,
             Some(OPENROUTER_PROVIDER) => OPENROUTER_BASE,
             Some(HMANLAB_PROVIDER) => HMANLAB_BASE,
+            Some(MINIMAX_PROVIDER) => MINIMAX_BASE,
             _ => &self.client.base,
         }
     }
@@ -81,6 +83,10 @@ impl App {
             ))),
             HMANLAB_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
                 HMANLAB_BASE.to_string(),
+                key,
+            ))),
+            MINIMAX_PROVIDER => Some(LlmBackend::OpenAi(openai_compat::Client::new(
+                MINIMAX_BASE.to_string(),
                 key,
             ))),
             _ => None,
@@ -142,6 +148,9 @@ impl App {
         if self.has_byok_key(HMANLAB_PROVIDER) {
             self.ensure_hmanlab_models();
         }
+        if self.has_byok_key(MINIMAX_PROVIDER) {
+            self.ensure_minimax_models();
+        }
         self.persist_config();
     }
 
@@ -152,6 +161,19 @@ impl App {
         for name in HMANLAB_MODELS {
             self.extra_models.push(ExtraModel {
                 provider: HMANLAB_PROVIDER.to_string(),
+                name: (*name).to_string(),
+            });
+        }
+    }
+
+    /// Replace any persisted `minimax` entries with the current
+    /// MINIMAX_MODELS seed. Canonical-replacement pattern so the picker
+    /// stays in sync with whatever the current MiniMax plan exposes.
+    pub(super) fn ensure_minimax_models(&mut self) {
+        self.extra_models.retain(|m| m.provider != MINIMAX_PROVIDER);
+        for name in MINIMAX_MODELS {
+            self.extra_models.push(ExtraModel {
+                provider: MINIMAX_PROVIDER.to_string(),
                 name: (*name).to_string(),
             });
         }
@@ -335,6 +357,7 @@ impl App {
             cfg.opencode_api_key = snap.byok_keys.get(OPENCODE_PROVIDER).cloned();
             cfg.openrouter_api_key = snap.byok_keys.get(OPENROUTER_PROVIDER).cloned();
             cfg.hmanlab_api_key = snap.byok_keys.get(HMANLAB_PROVIDER).cloned();
+            cfg.minimax_api_key = snap.byok_keys.get(MINIMAX_PROVIDER).cloned();
             cfg.extra_models = snap.extra_models;
             cfg.agents = snap.agents;
             let _ = crate::config::save(&cfg);

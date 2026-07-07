@@ -144,7 +144,11 @@ impl App {
             ),
             p if p == crate::config::HMANLAB_PROVIDER => (
                 "Paste your hmanlab API key (sk-… from https://ai.hmanlab.pro)",
-                "hmanlab",
+                "Hibiscus",
+            ),
+            p if p == crate::config::MINIMAX_PROVIDER => (
+                "Paste your MiniMax API key",
+                "MiniMax",
             ),
             _ => ("Paste your z.ai coding-plan API key", "z.ai subscription"),
         };
@@ -190,7 +194,11 @@ impl App {
                     }
                     p if p == crate::config::HMANLAB_PROVIDER => {
                         self.ensure_hmanlab_models();
-                        ("hmanlab", crate::config::HMANLAB_DEFAULT_MODEL)
+                        ("Hibiscus", crate::config::HMANLAB_DEFAULT_MODEL)
+                    }
+                    p if p == crate::config::MINIMAX_PROVIDER => {
+                        self.ensure_minimax_models();
+                        ("MiniMax", crate::config::MINIMAX_DEFAULT_MODEL)
                     }
                     _ => {
                         self.ensure_zai_models_for(&provider);
@@ -263,29 +271,6 @@ impl App {
             self.status = format!("Model: {}", self.model);
             let _ = persist_last_model(&self.model, None);
         }
-    }
-
-    pub(in crate::app) fn list_models_inline(&mut self) {
-        if self.models.is_empty() {
-            self.push_info("No models. Try /host <url> first.".into());
-            return;
-        }
-        let list: Vec<String> = self
-            .models
-            .iter()
-            .map(|m| {
-                if m == &self.model {
-                    format!("  * {m}  (current)")
-                } else {
-                    format!("    {m}")
-                }
-            })
-            .collect();
-        self.push_info(format!(
-            "Available models ({}):\n{}",
-            self.models.len(),
-            list.join("\n")
-        ));
     }
 }
 

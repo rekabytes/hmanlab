@@ -60,6 +60,8 @@ pub async fn agent_loop_with(
     tx: mpsc::UnboundedSender<StreamMsg>,
     tool_defs: Vec<crate::ollama::Tool>,
     specialists: Vec<SpecialistRunner>,
+    mcp_active_provider: Option<String>,
+    mcp_keys: std::collections::HashMap<String, String>,
 ) {
     // ToolContext gets a clone of the same stream channel the rest of
     // the agent loop sends through. Confirm requests and specialist
@@ -69,6 +71,8 @@ pub async fn agent_loop_with(
         workspace: workspace.clone(),
         stream_tx: tx.clone(),
         specialists,
+        mcp_active_provider,
+        mcp_keys,
     };
 
     let mut full_history: Vec<ChatMessage> =
@@ -232,6 +236,8 @@ pub async fn run_specialist_consult(
         sub_tx,
         crate::tools::ask_specialist_tool_defs(),
         Vec::new(), // no nested specialists — chain prevention
+        None,       // specialists don't get MCP web-search tools
+        std::collections::HashMap::new(),
     ));
 
     let mut reply = String::new();

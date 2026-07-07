@@ -99,6 +99,14 @@ pub struct ChatMessage {
     /// over the wire — only relevant locally to the UI.
     #[serde(skip)]
     pub diff: Option<Vec<crate::tools::DiffLine>>,
+    /// Original JSON arguments the model passed to the tool. Stamped in
+    /// `on_tool_start` so the collapsed tile in the chat renderer can show
+    /// a clean summary (e.g. `src/main.rs · 312 lines`) without re-parsing
+    /// the placeholder content string. Never sent back to the model on a
+    /// re-submit — the agent loop already keeps its own copy in the
+    /// turn-bound `tool_calls` array.
+    #[serde(skip)]
+    pub tool_args: Option<Value>,
     /// Image/media attachments. Not serialized to disk (session persistence)
     /// — images should be re-read from disk, not stored in chat history JSON.
     #[serde(default, skip_serializing, skip_deserializing)]

@@ -24,6 +24,7 @@ mod memory_tools;
 mod patch;
 mod read;
 mod shell;
+mod websearch;
 mod workspace;
 mod write;
 
@@ -59,6 +60,14 @@ pub struct ToolContext {
     /// anyone — either agents are session-disabled, or this is a nested
     /// specialist call (no chaining, no recursion).
     pub specialists: Vec<crate::agent::SpecialistRunner>,
+    /// Active MCP web-search provider id ("brave", "exa", "tavily",
+    /// "parallel"). `None` if web-search is not configured — in that
+    /// case `web_search` / `web_fetch` won't appear in the tool surface
+    /// so the model can't call them, but we still guard here defensively.
+    pub mcp_active_provider: Option<String>,
+    /// API keys for MCP providers that require them (keyed by provider id).
+    /// Parallel and Exa (basic tier) will never be present here.
+    pub mcp_keys: std::collections::HashMap<String, String>,
 }
 
 /// Send a confirmation request to the UI and wait for the user's y/n.
@@ -86,7 +95,12 @@ pub(super) async fn confirm(
 /// surface. When such a model emits its trained name, route it to the matching
 /// hmanlab handler instead of failing with "unknown tool". Snake_case names
 /// pass through unchanged.
-fn resolve_tool_alias(name: &str) -> &str {
+///
+/// Exposed as `pub` so the chat renderer can canonicalise a tool name
+/// before looking up its icon / label / grouping noun — otherwise a
+/// `Read` call and a `read_file` call in the same turn would render as
+/// two different verbs and miss the consolidation tile.
+pub fn resolve_tool_alias(name: &str) -> &str {
     match name {
         "Read" => "read_file",
         "LS" | "List" => "list_dir",
@@ -96,6 +110,8 @@ fn resolve_tool_alias(name: &str) -> &str {
         "MultiEdit" => "multi_edit",
         "Write" => "write_file",
         "ApplyPatch" => "apply_patch",
+        "WebSearch" => "web_search",
+        "WebFetch" => "web_fetch",
         other => other,
     }
 }
@@ -116,6 +132,8 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "git_diff"
             | "git_show"
             | "read_memory"
+            | "web_search"
+            | "web_fetch"
     )
 }
 
@@ -174,6 +192,8 @@ pub async fn execute_tool(name: &str, args: &Value, ctx: &ToolContext) -> Result
         "save_memory" => memory_tools::tool_save_memory(args, ctx).await,
         "read_memory" => memory_tools::tool_read_memory(args, ctx).await,
         "forget_memory" => memory_tools::tool_forget_memory(args, ctx).await,
+        "web_search" => websearch::tool_web_search(args, ctx).await,
+        "web_fetch" => websearch::tool_web_fetch(args, ctx).await,
         "consult_specialist" => tool_consult_specialist(args, ctx).await,
         other => bail!("unknown tool: {other}"),
     }

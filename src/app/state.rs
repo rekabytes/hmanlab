@@ -29,10 +29,22 @@ pub struct RenderState {
     /// is_dir)`. The click handler converts `screen_y` to a logical
     /// line, looks up the matching entry, and toggles or opens it.
     pub sidebar_targets: Vec<(u16, PathBuf, bool)>,
-    /// One row per visible card-style tool tile — `(logical_line_idx,
-    /// message_idx)`. The hover overlay uses this to repaint the cell
-    /// bg under the cursor; clicking a card row toggles `expanded_tools`.
+    /// One row per visible card-style tool tile — `(absolute_screen_y,
+    /// message_idx)`. The mouse handler reads this to convert click
+    /// rows into expand/collapse toggles on `App::expanded_tools`. The
+    /// post-render buffer pass uses it to paint the BG_CARD tile
+    /// background under each row. Reset every frame by the chat
+    /// renderer so stale rows from a prior frame can't catch a click.
     pub card_row_targets: Vec<(u16, usize)>,
+    /// Start indices of every multi-tool group (≥2 consecutive tool
+    /// messages) the renderer saw this frame. Populated by
+    /// `render_chat`; read by the click handler to decide whether a
+    /// click on `card_row_targets` row should toggle
+    /// `App::expanded_tool_groups` (group expansion — shows every
+    /// member's tile + body) or `App::expanded_tools` (single-tile
+    /// body expansion). Reset every frame so a stale entry from a
+    /// prior render can't route a click into the wrong set.
+    pub multi_group_starts: std::collections::HashSet<usize>,
     /// `(message_idx, logical_line_start_excl, logical_line_end_excl)`
     /// per visible message. The mouse handler converts a click row into
     /// a logical line, then finds the message that owns it.
@@ -54,6 +66,23 @@ pub struct RenderState {
     pub shell_indicator_x: u16,
     pub shell_indicator_y: u16,
     pub shell_indicator_w: u16,
+
+    // ── Sidebar tab hit-test ─────────────────────────────────────────
+    /// Absolute screen rects `(x, y, w, h)` for each sidebar tab cell.
+    /// Populated by `render_sidebar` each frame; the click handler uses
+    /// them to switch the active tab. Zeroed by clearing the rect
+    /// vec when the sidebar itself is hidden (width < SIDEBAR_MIN).
+    pub sidebar_tab_rects: Vec<(u16, u16, u16, u16)>,
+
+    // ── Permission card hit-test (inline confirm UI) ─────────────────
+    // Absolute screen rect for the Approve button, populated each
+    // frame by `render_chat` when a permission card is on screen and
+    // `pending_confirm.is_some()`. `(x, y, w, h)` — y is post-scroll
+    // so the mouse handler doesn't need to know about chat scroll
+    // state. Cleared to None when no permission is pending so a
+    // stale rect from a prior frame can't catch a stray click.
+    pub permission_btn_approve: Option<(u16, u16, u16, u16)>,
+    pub permission_btn_deny: Option<(u16, u16, u16, u16)>,
 }
 
 /// Which level of the two-level model picker is active.
@@ -105,6 +134,41 @@ impl ProviderRow {
 pub enum ModelRow {
     Ollama(String),
     Extra(crate::config::ExtraModel),
+}
+
+/// One row of the agent's plan / todo list. Parsed from the assistant's
+/// streamed markdown (`- [ ] …`, `- [x] …`, `- [-] …`) and rendered as
+/// a checklist in the inspector pane. `Active` is what the model marks
+/// with `[~]` — we treat that as "currently working on" so the row gets
+/// the peach accent instead of the dim pending color.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanItem {
+    pub text: String,
+    pub state: PlanState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanState {
+    Pending,
+    Active,
+    Done,
+}
+
+/// Which sidebar view is active. Switched by clicking the tab strip
+/// at the top of the sidebar column. Tabs are visual only — the data
+/// sources they show (saved sessions, specialist agents) already live
+/// on `App`; the tab just selects which one the renderer draws.
+///
+/// History: the sidebar used to also have a Files tab showing a
+/// workspace tree. That was removed when the layout switched to the
+/// flat opencode-style sidebar (Sessions + Agents only) — file
+/// browsing is now strictly via the file viewer (click a path in
+/// chat → opens).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SidebarTab {
+    #[default]
+    Sessions,
+    Agents,
 }
 
 impl ModelRow {
@@ -165,6 +229,11 @@ pub enum Mode {
     /// Ctrl+C kills the child but stays in the monitor so the user can
     /// read the final output before dismissing.
     ShellMonitor,
+    /// `/mcp` — web search provider setup. Three-screen wizard:
+    ///  1. ProviderList — pick Brave, Exa, Tavily, or Parallel
+    ///  2. KeyInput — enter the API key (skipped for key-free providers)
+    ///  3. Confirmed — success screen, press Enter/Esc to return to Chat
+    McpSetup,
 }
 
 /// Live state for the one shell command the agent has in flight (or
@@ -419,4 +488,20 @@ pub struct DisconnectEntry {
     /// seeds a longer catalog. Lets the user see what they're about to
     /// drop before pressing Enter.
     pub preview: String,
+}
+
+/// Which screen of the `/mcp` three-step wizard is active.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum McpSetupScreen {
+    /// Screen 1 — list of supported providers. Up/Down navigates,
+    /// Enter advances to KeyInput (or directly to Confirmed for
+    /// key-free providers like Exa and Parallel).
+    #[default]
+    ProviderList,
+    /// Screen 2 — free-text API key entry. Enter saves and advances
+    /// to Confirmed; Ctrl+D clears the stored key; Esc goes back to
+    /// ProviderList.
+    KeyInput,
+    /// Screen 3 — success confirmation. Enter or Esc returns to Chat.
+    Confirmed,
 }

@@ -13,8 +13,6 @@ impl App {
     /// on disk; the next message sent will append to a *new* session.
     pub(in crate::app) fn clear_history(&mut self) {
         self.messages.clear();
-        self.expanded_tools.clear();
-        self.expanded_thoughts.clear();
         self.total_prompt_tokens = 0;
         self.total_completion_tokens = 0;
         self.last_prompt_tokens = 0;
@@ -33,8 +31,6 @@ impl App {
     /// `/new` — wipe visible history and start a fresh local session.
     pub(in crate::app) fn new_session(&mut self) {
         self.messages.clear();
-        self.expanded_tools.clear();
-        self.expanded_thoughts.clear();
         self.total_prompt_tokens = 0;
         self.total_completion_tokens = 0;
         self.last_prompt_tokens = 0;

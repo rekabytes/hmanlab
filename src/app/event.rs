@@ -47,6 +47,7 @@ impl App {
                     Mode::TelegramSetup => Ok(self.handle_telegram_setup_key(key, tx)),
                     Mode::AgentsSetup => Ok(self.handle_agents_setup_key(key, tx)),
                     Mode::ShellMonitor => Ok(self.handle_shell_monitor_key(key)),
+                    Mode::McpSetup => Ok(self.handle_mcp_setup_key(key, tx)),
                     Mode::Chat => Ok(self.handle_chat(key, tx)),
                 }
             }
@@ -62,7 +63,6 @@ impl App {
         match cmd {
             Command::Model(None) => self.open_picker(),
             Command::Model(Some(name)) => self.switch_model(&name),
-            Command::ListModels => self.list_models_inline(),
             Command::Clear => self.clear_history(),
             Command::Quit => return AppAction::Quit,
             Command::Help => self.show_help_inline(),
@@ -84,6 +84,7 @@ impl App {
             Command::Attach(path) => self.handle_attach(path),
             Command::Detach(arg) => self.handle_detach(arg),
             Command::Paste => self.paste_from_clipboard(),
+            Command::Mcp => self.handle_mcp(),
             Command::Unknown(name) => {
                 self.push_info(format!(
                     "Unknown command: /{name}\nType /help to see available commands."
@@ -164,6 +165,11 @@ impl App {
     fn start_turn(&mut self, text: String, hidden: bool, tx: &mpsc::UnboundedSender<StreamMsg>) {
         // Persist user message to local JSONL session (skip hidden Y/N injections).
         if !hidden {
+            // A new user turn means the previous plan is stale — the
+            // agent will either re-issue an updated plan in its reply
+            // or skip it entirely. Clear so the inspector doesn't
+            // dangle a finished checklist from the prior turn.
+            self.plan.clear();
             self.ensure_local_session();
             if let (Some(sid), Some(path)) = (
                 self.local_session_id.clone(),
@@ -222,11 +228,14 @@ impl App {
         let model = self.model.clone();
         let workspace = self.workspace.clone();
         let runners = self.live_specialist_runners();
-        let tool_defs = crate::tools::tool_definitions_with(&runners);
+        let tool_defs = crate::tools::tool_definitions_with(&runners, self.mcp_active_provider.as_deref());
+        let mcp_active_provider = self.mcp_active_provider.clone();
+        let mcp_keys = self.mcp_keys.clone();
         let tx = tx.clone();
         let handle = tokio::spawn(async move {
             crate::agent::agent_loop_with(
                 backend, model, history, workspace, tx, tool_defs, runners,
+                mcp_active_provider, mcp_keys,
             )
             .await;
         });

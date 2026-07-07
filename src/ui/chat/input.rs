@@ -1,12 +1,10 @@
-//! `render_input` — the bottom textarea. The block's title and border
-//! colour reflect the input's current mode (generating, slash command,
-//! Y/N pending, normal), so the box state is scannable from across the
-//! screen without reading the actual contents.
+//! `render_input` — the bottom textarea. No border in the opencode-
+//! style flat layout; the input sits on BG_BASE with a peach underline
+//! (via `tui-textarea`'s cursor-line style) as the focus affordance.
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
-    text::Span,
+    style::Style,
     widgets::Padding,
     Frame,
 };
@@ -19,25 +17,18 @@ pub(in crate::ui) fn render_input(f: &mut Frame, area: Rect, app: &mut App) {
     let first_line = app.input.lines().first().cloned().unwrap_or_default();
     let is_cmd = first_line.trim_start().starts_with('/');
 
-    // Title encodes input mode; border colour echoes it so the box state
-    // is scannable from across the screen.
-    let (mut title, border_color) = if app.turn.is_generating() {
-        (
-            "▎ generating · Ctrl+C to cancel".to_string(),
-            theme::color::WARNING,
-        )
+    // Title encodes input mode. Border colour used to echo it but with
+    // the opencode-style flat layout there's no border — the title
+    // itself is the only mode signal, so we render it as a small
+    // dim prefix above the textarea (handled in the render block below).
+    let mut title = if app.turn.is_generating() {
+        "▎ generating · Ctrl+C to cancel".to_string()
     } else if is_cmd {
-        (
-            "▎ command · Enter to run".to_string(),
-            theme::color::ACCENT_ALT,
-        )
+        "▎ command · Enter to run".to_string()
     } else if app.yn_pending {
-        (
-            "▎ [Y] yes  ·  [N] no  ·  type to override".to_string(),
-            theme::color::ASSISTANT,
-        )
+        "▎ [Y] yes  ·  [N] no  ·  type to override".to_string()
     } else {
-        ("▎ message".to_string(), theme::color::ACCENT)
+        "▎ message".to_string()
     };
 
     // Append a queued-attachments summary to the title so the user knows
@@ -59,21 +50,25 @@ pub(in crate::ui) fn render_input(f: &mut Frame, area: Rect, app: &mut App) {
         title.push_str(&format!(" · attached {n}: {summary}"));
     }
 
+// The input box is the ONLY elevated surface in the flat layout —
+    // BG_CHAT (one step lighter than the global BG_BASE) — so it reads as
+    // the focused affordance without needing a border. No border.
+    // Horizontal padding stays so long inputs don't run to the edge;
+    // 1 row of top padding gives the textarea breathing room from
+    // the chat content above (no glued-to-chat feel).
     let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::horizontal(1));
+        .borders(ratatui::widgets::Borders::NONE)
+        .style(Style::default().bg(theme::color::BG_CHAT))
+        .padding(Padding {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        });
     app.input.set_block(block);
     // Stash the inner content width so the event handler can soft-wrap
     // typed characters before they push the cursor off the right edge.
-    // -2 for the rounded borders, -2 for the horizontal padding.
-    app.render.input_inner_w = area.width.saturating_sub(4);
+    // -2 for the horizontal padding (no border subtract now).
+    app.render.input_inner_w = area.width.saturating_sub(2);
     f.render_widget(&app.input, area);
 }

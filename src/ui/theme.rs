@@ -35,6 +35,23 @@ pub mod color {
     pub const FG_DIM: Color = Color::Rgb(108, 112, 134); // overlay0
     pub const FG_DIMMER: Color = Color::Rgb(69, 71, 90); // surface1
 
+    // ── OpenCode-style flat surface palette ──────────────────────────
+    // Neutral greys — no blue tint. Chat area + sidebar + inspector
+    // share the deepest dark grey (BG_BASE); the input box is the
+    // only lighter-grey surface (BG_CHAT) so it reads as the focused
+    // affordance without a border.
+    //
+    //   BG_BASE  (28, 28, 28)  — chat, sidebar, inspector, chrome
+    //   BG_CHAT  (60, 60, 60)  — input box (the only elevated surface)
+    /// Deepest layer — used for the global terminal bg + chat +
+    /// sidebar + inspector + header + status bar. Neutral dark grey,
+    /// no blue tint.
+    pub const BG_BASE: Color = Color::Rgb(28, 28, 28);
+    /// Elevated surface — used for the input box only. Light grey
+    /// one step up from BG_BASE so the box reads as the focused
+    /// affordance without a border.
+    pub const BG_CHAT: Color = Color::Rgb(60, 60, 60);
+
     // Borders
     pub const BORDER_ACTIVE: Color = ACCENT; // peach
     pub const BORDER_IDLE: Color = Color::Rgb(69, 71, 90); // surface1
@@ -53,6 +70,57 @@ pub mod color {
     pub const SUCCESS: Color = USER;
     pub const ERROR: Color = TOOL_ERROR;
     pub const WARNING: Color = Color::Rgb(249, 226, 175); // yellow
+
+    // ── Semantic palette (agentic UI) ─────────────────────────────────
+    // Colors that mean something *in context* — diffs, permissions,
+    // todos, agent state. Re-using base Catppuccin tokens where possible
+    // so the new vocabulary stays cohesive with the existing look.
+
+    /// Diff additions — green that reads clearly on both the chat surface
+    /// (dark) and the BG_CARD inspector tile. Same hue as USER but kept
+    /// as its own constant so a future theme tweak (e.g. dim green for
+    /// "added by tool, not by user") has one knob.
+    pub const DIFF_ADD: Color = Color::Rgb(166, 227, 161); // green
+    /// Diff removals — desaturated red so it doesn't shout on a card.
+    pub const DIFF_REMOVE: Color = Color::Rgb(243, 139, 168); // red
+
+    /// A pending todo item — neutral dim, indicating "not started yet".
+    pub const TODO_PENDING: Color = Color::Rgb(166, 173, 200); // subtext1
+    /// A todo currently in progress — peach (the agent's accent), so it
+    /// visually matches the active-tool dot in the inspector.
+    pub const TODO_ACTIVE: Color = Color::Rgb(250, 179, 135); // peach
+    /// A completed todo — green, matching the user/assistant-success palette.
+    pub const TODO_DONE: Color = Color::Rgb(166, 227, 161); // green
+
+    /// Read-only permission prompt (e.g. share a file path back to the
+    /// user). Soft yellow — "look at this", not "watch out".
+    pub const PERMISSION_INFO: Color = Color::Rgb(249, 226, 175); // yellow
+    /// Destructive action — `run_command`, `write_file` overwrite,
+    /// `forget_memory`. Bright red so the card edges scream for attention.
+    pub const PERMISSION_DESTRUCTIVE: Color = Color::Rgb(243, 139, 168); // red
+    /// Modifier-style destructive background (low-alpha red on top of the
+    /// panel bg). Use as `bg(...)` only — not as fg, would clash.
+    pub const PERMISSION_DESTRUCTIVE_BG: Color = Color::Rgb(70, 40, 50); // muted maroon
+
+    /// Agent state badge colors — Idle (dim), Thinking (mauve), Tooling
+    /// (peach). Inspector header uses these for the small "● THINKING"
+    /// chip in the top-right.
+    pub const STATE_IDLE: Color = Color::Rgb(108, 112, 134); // overlay0
+    pub const STATE_THINKING: Color = Color::Rgb(203, 166, 247); // mauve
+    pub const STATE_TOOLING: Color = Color::Rgb(250, 179, 135); // peach
+    pub const STATE_COMPACTING: Color = Color::Rgb(137, 180, 250); // blue
+
+    /// Inspector background — one step deeper than BG_CARD so the right
+    /// column reads as the "system/dashboard" surface vs. the chat surface
+    /// (which is transparent over the base bg).
+    pub const BG_INSPECTOR: Color = Color::Rgb(35, 36, 50); // between base & surface0
+    /// Hovered inspector row — matches BG_CARD_HOVER for parity with chat.
+    pub const BG_INSPECTOR_HOVER: Color = Color::Rgb(60, 62, 84);
+
+    /// Sidebar selected-tab indicator (active sessions/agents/files tab).
+    pub const TAB_ACTIVE: Color = Color::Rgb(250, 179, 135); // peach
+    /// Sidebar inactive tab text.
+    pub const TAB_INACTIVE: Color = Color::Rgb(108, 112, 134); // overlay0
 }
 
 /// Horizontal inset inside any panel border. One col on each side gives

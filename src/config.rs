@@ -169,6 +169,7 @@ pub const BYOK_PROVIDERS: &[&str] = &[
     OPENCODE_PROVIDER,
     OPENROUTER_PROVIDER,
     HMANLAB_PROVIDER,
+    MINIMAX_PROVIDER,
 ];
 
 /// hmanlab — OpenAI-compatible relay managed by hmanlab. Users buy
@@ -190,6 +191,20 @@ pub const HMANLAB_MODELS: &[&str] = &[
 ];
 pub const HMANLAB_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// MiniMax — direct OpenAI-compatible endpoint at `api.minimax.io`.
+/// Plan-based billing managed on the MiniMax side; the TUI just sends
+/// requests with the user's Bearer key. Slug convention is the raw
+/// model id (`MiniMax-M3`, `M2.7`, `M2.6`) — the API expects bare
+/// IDs, not namespaced ones.
+pub const MINIMAX_PROVIDER: &str = "minimax";
+pub const MINIMAX_BASE: &str = "https://api.minimax.io/v1";
+pub const MINIMAX_MODELS: &[&str] = &[
+    "MiniMax-M3",
+    "M2.7",
+    "M2.6",
+];
+pub const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M3";
+
 /// Human-readable provider name for UI display. Used by the picker's
 /// `+ Add <name> key` rows, the `/disconnect` list, and `/settings`.
 /// Falls back to the raw provider id for anything we don't know about
@@ -202,6 +217,7 @@ pub fn provider_label(provider: &str) -> &str {
         OPENCODE_PROVIDER => "OpenCode Go",
         OPENROUTER_PROVIDER => "OpenRouter",
         HMANLAB_PROVIDER => "hmanlab",
+        MINIMAX_PROVIDER => "MiniMax",
         other => other,
     }
 }
@@ -339,6 +355,10 @@ pub struct Config {
     /// app; paste the key here to use hmanlab-served models from the TUI.
     #[serde(default)]
     pub hmanlab_api_key: Option<String>,
+    /// MiniMax API key (Bearer auth against api.minimax.io/v1).
+    /// Plan-based billing managed on the MiniMax side.
+    #[serde(default)]
+    pub minimax_api_key: Option<String>,
     #[serde(default)]
     pub extra_models: Vec<ExtraModel>,
     /// Absolute workspace paths the user has explicitly authorised. The
@@ -383,6 +403,24 @@ pub struct Config {
     /// does not (handled per-process on `App.agents_session_enabled`).
     #[serde(default)]
     pub agents: AgentsConfig,
+
+    // ── MCP / web-search ────────────────────────────────────────────────
+    /// Which search provider is active. One of "brave", "exa", "tavily",
+    /// or "parallel". When set, the `web_search` and `web_fetch` tools are
+    /// added to the model's tool surface on every turn.
+    #[serde(default)]
+    pub mcp_active_provider: Option<String>,
+    /// API key for Brave Search (https://api.search.brave.com).
+    /// Free tier: 2,000 queries/month.
+    #[serde(default)]
+    pub brave_search_api_key: Option<String>,
+    /// API key for Exa AI (https://exa.ai). Optional — basic tier works
+    /// unauthenticated; a key raises rate limits.
+    #[serde(default)]
+    pub exa_api_key: Option<String>,
+    /// API key for Tavily (https://tavily.com). Free tier: 1,000/month.
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -465,6 +503,11 @@ pub async fn run_setup_wizard(existing_ollama: Option<&str>) -> Result<Config> {
         } else {
             ""
         };
+        let minimax_state = if cfg.minimax_api_key.is_some() {
+            " (configured)"
+        } else {
+            ""
+        };
         let ollama_state = match &cfg.ollama_host {
             Some(h) => format!(" (configured: {h})"),
             None => String::new(),
@@ -475,7 +518,8 @@ pub async fn run_setup_wizard(existing_ollama: Option<&str>) -> Result<Config> {
         println!("  4) OpenCode Go{opencode_state}");
         println!("  5) OpenRouter{openrouter_state}");
         println!("  6) hmanlab (prox){prox_state}");
-        println!("  7) local Ollama{ollama_state}");
+        println!("  7) MiniMax{minimax_state}");
+        println!("  8) local Ollama{ollama_state}");
         print!("  > ");
         io::stdout().flush()?;
         let mut choice = String::new();
@@ -522,13 +566,19 @@ pub async fn run_setup_wizard(existing_ollama: Option<&str>) -> Result<Config> {
                 }
             }
             "7" => {
+                cfg.minimax_api_key = prompt_api_key("MiniMax")?;
+                if cfg.minimax_api_key.is_some() {
+                    println!("  \x1b[32m✓\x1b[0m MiniMax key saved.");
+                }
+            }
+            "8" => {
                 cfg.ollama_host = prompt_ollama_host(existing_ollama)?;
                 if cfg.ollama_host.is_some() {
                     println!("  \x1b[32m✓\x1b[0m Ollama URL saved.");
                 }
             }
             _ => {
-                println!("  (unknown — type 1–7 or Enter to skip)");
+                println!("  (unknown — type 1–8 or Enter to skip)");
             }
         }
         println!();

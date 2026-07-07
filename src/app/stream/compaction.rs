@@ -55,10 +55,6 @@ impl App {
         };
         self.messages.clear();
         self.messages.push(summary_msg);
-        // Tool expansion state pointed at indices that no longer
-        // exist; clear it so no stale highlights remain.
-        self.expanded_tools.clear();
-        self.expanded_thoughts.clear();
         // Reset the auto-compact trigger — the next turn starts
         // small again.
         self.last_prompt_tokens = 0;

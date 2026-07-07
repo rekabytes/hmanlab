@@ -36,36 +36,50 @@ impl App {
         }
 
         // Inline autocomplete popup (slash / @ mention) intercept — must
-        // come before the global Esc, Up/Down scroll, and Enter-submit
-        // handlers so the popup gets first dibs on its own navigation keys.
-        if self.inline_popup.is_open() && key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.inline_popup = InlinePopup::None;
-                    return AppAction::Continue;
-                }
-                KeyCode::Up => {
-                    self.inline_popup_select_prev();
-                    return AppAction::Continue;
-                }
-                KeyCode::Down => {
-                    self.inline_popup_select_next();
-                    return AppAction::Continue;
-                }
-                KeyCode::Tab => {
-                    self.inline_popup_complete();
-                    return AppAction::Continue;
-                }
-                KeyCode::Enter => {
-                    // Completion-on-Enter — popup absorbs Enter, user
-                    // presses Enter again to actually submit. Matches the
-                    // shell-autocomplete convention.
-                    self.inline_popup_complete();
-                    return AppAction::Continue;
-                }
-                _ => {}
+    // come before the global Esc, Up/Down scroll, and Enter-submit
+    // handlers so the popup gets first dibs on its own navigation keys.
+    if self.inline_popup.is_open() && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Esc => {
+                self.inline_popup = InlinePopup::None;
+                return AppAction::Continue;
             }
+            KeyCode::Up => {
+                self.inline_popup_select_prev();
+                return AppAction::Continue;
+            }
+            KeyCode::Down => {
+                self.inline_popup_select_next();
+                return AppAction::Continue;
+            }
+            KeyCode::Tab => {
+                // Tab still inserts the text into the input box (for
+                // cases where the user wants to keep editing — e.g.
+                // `/model ` then typing a model name). Single-press
+                // autocomplete behaviour.
+                self.inline_popup_complete();
+                return AppAction::Continue;
+            }
+            KeyCode::Enter => {
+                // Slash popup: run the command immediately on first
+                // press. Matches opencode / claude-code / most chat
+                // clients' behaviour where selecting from the
+                // autocomplete popup triggers the command without an
+                // extra Enter. The user no longer has to press Enter
+                // twice to open `/model` etc.
+                //
+                // File popup: keep the legacy "insert text" behaviour
+                // — `@` mentions insert the path into the input box
+                // (the user might want to keep typing around it).
+                if matches!(self.inline_popup, InlinePopup::Slash(_)) {
+                    return self.inline_popup_run(tx);
+                }
+                self.inline_popup_complete();
+                return AppAction::Continue;
+            }
+            _ => {}
         }
+    }
 
         // Y/N quick-reply intercept — only when the AI just asked a yes/no
         // question and the input is empty. Plain key, no modifiers.
@@ -117,14 +131,14 @@ impl App {
                     self.clear_history();
                     return AppAction::Continue;
                 }
-                KeyCode::Char('n') => {
+KeyCode::Char('n') => {
                     self.new_session();
                     return AppAction::Continue;
                 }
-                KeyCode::Char('t') => {
-                    self.toggle_all_tools();
-                    return AppAction::Continue;
-                }
+                // Ctrl+T — was fold-toggle. Removed when tool /
+                // thinking fold UI was stripped from the chat
+                // renderer. Re-bind to a redesign when we add a new
+                // fold surface.
                 // Ctrl+J — classic terminal newline (raw 0x0A). Always
                 // works regardless of terminal Shift+Enter support, so we
                 // bind it explicitly as a universal "insert newline"
@@ -237,34 +251,14 @@ impl App {
     }
 
     fn toggle_all_tools(&mut self) {
-        // Toggles two fold categories together: tool result blocks AND the
-        // assistant `<think>` reasoning blocks. Either one being expanded
-        // counts as "expanded" — collapse them all; otherwise expand them all.
-        let tool_indices: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role == "tool")
-            .map(|(i, _)| i)
-            .collect();
-        let thought_indices: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role == "assistant" && m.content.contains("</think>"))
-            .map(|(i, _)| i)
-            .collect();
-        let any_expanded = !self.expanded_tools.is_empty() || !self.expanded_thoughts.is_empty();
-        if any_expanded {
-            self.expanded_tools.clear();
-            self.expanded_thoughts.clear();
-            self.status = "Folds collapsed".into();
-        } else {
-            self.expanded_tools = tool_indices.into_iter().collect();
-            self.expanded_thoughts = thought_indices.into_iter().collect();
-            self.status = "Folds expanded".into();
-        }
+        // (Removed when tool / thinking fold UI was stripped from the
+        // chat renderer. Re-introduce a single bulk toggle when we
+        // redesign the fold surface.)
     }
+
+    // toggle_all_tools / toggle_all_thoughts removed when the tool /
+    // thinking fold UI was stripped from the chat renderer. Re-introduce
+    // a single bulk toggle when we redesign the fold surface.
 
     /// Insert a synthetic newline into the current input line when typing
     /// has pushed the cursor row past `input_inner_w`. Tries a word
@@ -371,6 +365,49 @@ impl App {
             }
             InlinePopup::None => {}
         }
+    }
+
+    /// Slash popup only — Enter-key path. Runs the highlighted command
+    /// immediately instead of just inserting its text into the input
+    /// box (the legacy `inline_popup_complete` behaviour, kept for
+    /// Tab). Closes the popup, resets the input, and dispatches the
+    /// command through the normal `parse_command` → `handle_command`
+    /// pipeline so the resulting `AppAction` (e.g. opening a modal)
+    /// propagates back to the event loop.
+    ///
+    /// Commands that need positional args (`/ask <name> <query>`,
+    /// `/model <name>`) won't work here — pressing Enter on those
+    /// from the popup dispatches the bare command and the user gets
+    /// the command's "missing args" feedback. That's the correct UX:
+    /// picking from the popup is for "run the command" intent, not
+    /// "insert and edit" intent (Tab still does the latter).
+    fn inline_popup_run(
+        &mut self,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamMsg>,
+    ) -> AppAction {
+        let cmd_text = match &self.inline_popup {
+            InlinePopup::Slash(p) => p
+                .matches
+                .get(p.index)
+                .map(|&idx| format!("/{}", SLASH_COMMANDS[idx].name)),
+            _ => None,
+        };
+        // Close popup + clear input regardless of whether we found a
+        // command (an unexpected None case shouldn't leave the popup
+        // stuck open).
+        self.inline_popup = InlinePopup::None;
+        self.reset_input();
+        let Some(text) = cmd_text else {
+            return AppAction::Continue;
+        };
+        if let Some(cmd) = parse_command(&text) {
+            return self.handle_command(cmd, tx);
+        }
+        // Slash popup should never surface a non-command match, but if
+        // it does (e.g. a future filter accepts arbitrary text), send
+        // it through as a normal message so we never silently drop.
+        self.send_to_llm(text, tx);
+        AppAction::Continue
     }
 
     /// Insert the currently-highlighted completion into the input at the

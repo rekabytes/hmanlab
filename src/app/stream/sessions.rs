@@ -37,8 +37,6 @@ impl App {
         path: std::path::PathBuf,
     ) {
         self.messages = messages;
-        self.expanded_tools.clear();
-        self.expanded_thoughts.clear();
         self.page_state = PageState::Idle;
         if let Some(recorded) = model.as_deref() {
             if recorded != self.model {

@@ -63,7 +63,7 @@ impl App {
         if self.models.is_empty() && self.extra_models.is_empty() {
             self.send_telegram_dm(
                 chat_id,
-                "hmanlab has no model loaded right now. Try again once a model is configured."
+                "Hibiscus has no model loaded right now. Try again once a model is configured."
                     .into(),
             );
             return;
@@ -71,7 +71,7 @@ impl App {
         if self.turn.is_busy() {
             self.send_telegram_dm(
                 chat_id,
-                "hmanlab is busy on a previous turn — try again in a moment.".into(),
+                "Hibiscus is busy on a previous turn — try again in a moment.".into(),
             );
             return;
         }
@@ -85,7 +85,7 @@ impl App {
             // accurate message.
             self.send_telegram_dm(
                 chat_id,
-                "another Telegram chat is mid-conversation with hmanlab — try again shortly."
+                "another Telegram chat is mid-conversation with Hibiscus — try again shortly."
                     .into(),
             );
             return;
@@ -111,7 +111,7 @@ impl App {
             self.pending_telegram_reply_from = None;
             self.send_telegram_dm(
                 chat_id,
-                "hmanlab declined the request — check the terminal for details.".into(),
+                "Hibiscus declined the request — check the terminal for details.".into(),
             );
         }
     }
@@ -162,7 +162,7 @@ impl App {
             self.edit_telegram_message(
                 chat_id,
                 message_id,
-                "(This confirm is no longer pending — hmanlab moved on.)".into(),
+                "(This confirm is no longer pending — Hibiscus moved on.)".into(),
             );
             return;
         }
@@ -280,10 +280,6 @@ impl App {
             Some(super::Command::Help) => {
                 self.send_telegram_dm(chat_id, telegram_help_text());
             }
-            Some(super::Command::ListModels) => {
-                let listing = self.format_models_for_telegram();
-                self.send_telegram_dm(chat_id, listing);
-            }
             Some(super::Command::Model(None)) => {
                 self.send_telegram_dm(
                     chat_id,
@@ -301,7 +297,7 @@ impl App {
                         chat_id,
                         format!(
                             "No change — '{name}' didn't match a unique model. \
-                             Run /models on Telegram to see the list."
+                             Run /model on Telegram to see the picker."
                         ),
                     );
                 } else {
@@ -310,7 +306,7 @@ impl App {
             }
             Some(super::Command::New) => {
                 self.new_session();
-                self.send_telegram_dm(chat_id, "✓ New hmanlab session started.".into());
+                self.send_telegram_dm(chat_id, "✓ New Hibiscus session started.".into());
             }
             Some(super::Command::ListSessions) => {
                 self.telegram_cmd_sessions(chat_id);
@@ -349,43 +345,6 @@ impl App {
         }
     }
 
-    /// Plain-text snapshot of the model picker. Marks the currently
-    /// active row with `*`. Both Ollama and BYOK extras are listed;
-    /// BYOK rows include the provider tag so the user can disambiguate
-    /// two providers offering the same model name.
-    fn format_models_for_telegram(&self) -> String {
-        if self.models.is_empty() && self.extra_models.is_empty() {
-            return "No models loaded. Connect Ollama or a BYOK provider from the local TUI."
-                .into();
-        }
-        let mut s = String::new();
-        if !self.models.is_empty() {
-            s.push_str(&format!("Ollama ({}):\n", self.models.len()));
-            for m in &self.models {
-                let active = self.selected_extra.is_none() && m == &self.model;
-                let marker = if active { "*" } else { " " };
-                s.push_str(&format!("  {marker} {m}\n"));
-            }
-        }
-        if !self.extra_models.is_empty() {
-            if !s.is_empty() {
-                s.push('\n');
-            }
-            s.push_str(&format!("BYOK ({}):\n", self.extra_models.len()));
-            for em in &self.extra_models {
-                let active = self
-                    .selected_extra
-                    .as_ref()
-                    .map(|sel| sel.provider == em.provider && sel.name == em.name)
-                    .unwrap_or(false);
-                let marker = if active { "*" } else { " " };
-                s.push_str(&format!("  {marker} [{}] {}\n", em.provider, em.name));
-            }
-            s.push_str("\n(Switch BYOK models from the local TUI picker.)\n");
-        }
-        s
-    }
-
     /// `/sessions` from Telegram — no longer available.
     fn telegram_cmd_sessions(&mut self, chat_id: i64) {
         self.send_telegram_dm(
@@ -412,7 +371,7 @@ impl App {
             byok.join(", ")
         };
         let local = format!(
-            "hmanlab v{current}\n\
+            "Hibiscus v{current}\n\
              \x20 model       : {model}\n\
              \x20 ollama host : {host}\n\
              \x20 BYOK        : {byok_line}\n\
@@ -564,7 +523,7 @@ impl App {
         if self.turn.is_busy() {
             self.send_telegram_dm(
                 chat_id,
-                "hmanlab is busy on a previous turn — try again in a moment.".into(),
+                "Hibiscus is busy on a previous turn — try again in a moment.".into(),
             );
             return;
         }
@@ -575,7 +534,7 @@ impl App {
         {
             self.send_telegram_dm(
                 chat_id,
-                "another Telegram chat is mid-conversation with hmanlab — try again shortly."
+                "another Telegram chat is mid-conversation with Hibiscus — try again shortly."
                     .into(),
             );
             return;
@@ -1002,7 +961,7 @@ impl App {
             if already_paired {
                 format!("Already paired with hmanlab on {hostname}.")
             } else {
-                format!("✓ Paired with hmanlab on {hostname}.")
+                format!("✓ Paired with Hibiscus on {hostname}.")
             },
         ));
 
@@ -1121,11 +1080,11 @@ fn parse_yes_no(text: &str) -> Option<bool> {
 /// `handle_telegram_command` — anything missing from here would fall
 /// through to the "not available via Telegram" branch.
 fn telegram_help_text() -> String {
-    "hmanlab via Telegram — commands:\n\
+    "Hibiscus via Telegram — commands:\n\
      \x20 /help              this list\n\
      \x20 /sessions          recent saved sessions\n\
      \x20 /new               start a fresh session\n\
-     \x20 /models            list available models\n\
+     \x20 /model             open model picker\n\
      \x20 /model <name>      switch Ollama model (BYOK switch is local-only)\n\
      \x20 /settings          account + version snapshot\n\
      \x20 /agents            specialist roster + session state\n\

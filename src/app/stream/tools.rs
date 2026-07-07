@@ -14,9 +14,11 @@ impl App {
             role: "tool".into(),
             name: Some(name),
             content: format!("(running… args: {args_str})"),
+            tool_args: Some(args),
             ..Default::default()
         });
         self.active_tool_msg_idx = Some(self.messages.len() - 1);
+        self.active_tool_started_at = Some(std::time::Instant::now());
         self.follow = true;
     }
 
@@ -41,6 +43,7 @@ impl App {
             });
         }
         self.active_tool_msg_idx = None;
+        self.active_tool_started_at = None;
     }
 
     pub(super) fn on_shell_start(
@@ -98,6 +101,7 @@ impl App {
         // 🔏 Always for run_command, subsequent run_command prompts
         // auto-resolve in both places (no TUI popup, no DM).
         let head = prompt_head(&req.prompt);
+        let head_for_card = head.clone(); // also used by the inline card below
         if self.telegram_always_allow.contains(&head) {
             let _ = req.responder.send(true);
             self.push_info(format!(
@@ -134,6 +138,30 @@ impl App {
                 });
             }
         }
+        // Push the permission card into the chat history AFTER all the
+        // early-exit short-circuits (workspace untrusted / Telegram
+        // always-allow). The chat renderer sees role="permission" and
+        // draws an inline card with the diff + Approve/Deny buttons —
+        // see `ui::chat::messages::render_chat`. The card stays put as
+        // the user scrolls; `resolve_confirm` clears it once the user
+        // answers.
+        //
+        // First, drain any stale permission cards left over from a
+        // prior flow that crashed mid-resolve — they would otherwise
+        // stack and overflow the chat column (see the comment in
+        // `resolve_confirm`).
+        self.messages.retain(|m| m.role != "permission");
+        self.messages.push(crate::ollama::ChatMessage {
+            role: "permission".into(),
+            name: Some(head_for_card),
+            content: req.prompt.clone(),
+            diff: if req.diff.is_empty() {
+                None
+            } else {
+                Some(req.diff.clone())
+            },
+            ..Default::default()
+        });
         self.pending_confirm = Some(req);
         self.mode = Mode::Confirm;
         // Fresh prompt → start at the top. Without this, a long
@@ -141,6 +169,84 @@ impl App {
         // scrolled when the next, possibly-short prompt opens.
         self.confirm_scroll = 0;
         self.status = "Confirmation needed — y/n".into();
+    }
+
+    /// Resolve the currently-pending permission request — used by both
+    /// the keyboard handler (`handle_confirm` on y/n/Esc) and the
+    /// inline-card mouse click handler. Sends the answer through the
+    /// oneshot back to the tool task, replaces the permission card in
+    /// chat with an "info" outcome line, clears `pending_confirm`,
+    /// returns the user to Chat mode. Mirrors the Telegram side if
+    /// the prompt was DM'd.
+    pub(in crate::app) fn resolve_confirm(&mut self, approved: bool) {
+        let Some(req) = self.pending_confirm.take() else {
+            return;
+        };
+        let _ = req.responder.send(approved);
+
+        // Remove ALL permission cards from chat history. Earlier versions
+        // only dropped the last one via `rposition`, but if multiple
+        // accumulate (rapid tool calls, or a stale message from a
+        // prior flow that crashed mid-resolve), the leftovers keep
+        // rendering — and a permission card's box-drawing frame is
+        // wide enough that the right edge overflows the chat column
+        // into the inspector area when the chat is narrow. Drain them
+        // all here so we can't leak boxes into adjacent panels.
+        self.messages.retain(|m| m.role != "permission");
+
+        // Outcome line in chat history. Memory ops already render a
+        // tight result row on their own, so adding a third "Allowed:"
+        // line is noise — same carve-out as the legacy popup handler.
+        let is_memory_op = req.prompt.starts_with("SAVE memory")
+            || req.prompt.starts_with("UPDATE memory")
+            || req.prompt.starts_with("FORGET memory");
+        if !is_memory_op {
+            let prefix = if approved { "✓ Allowed" } else { "✗ Denied" };
+            self.push_info(format!("{prefix}: {}", req.prompt));
+        }
+
+        // Mirror the outcome back to Telegram if we also DM'd the
+        // prompt — overwrites the buttons so they no longer look
+        // actionable.
+        if let Some(ctx) = self.pending_telegram_confirm.take() {
+            let prefix = if approved { "Allowed" } else { "Denied" };
+            let body = format!(
+                "{} locally by the Hibiscus user: {}",
+                if approved { "✓ Allowed" } else { "✗ Denied" },
+                req.prompt
+            );
+            let _ = body; // body unused below — kept for parity with legacy
+            if let Some(message_id) = ctx.message_id {
+                self.edit_telegram_message(
+                    ctx.chat_id,
+                    message_id,
+                    format!("{prefix} locally by the Hibiscus user: {}", req.prompt),
+                );
+            } else {
+                self.send_telegram_dm(
+                    ctx.chat_id,
+                    format!("{prefix} locally by the Hibiscus user: {}", req.prompt),
+                );
+            }
+        }
+
+        // Attach the authorised diff DIRECTLY to the running tool
+        // placeholder right now — `active_tool_msg_idx` already points
+        // at it. Attaching here means the diff is in place before the
+        // file even gets written, so click-to-expand on the finished
+        // tool row always shows the diff. Skipped for `n` (deny) and
+        // for empty-diff tools (run_command etc.).
+        if approved && !req.diff.is_empty() {
+            if let Some(idx) = self.active_tool_msg_idx {
+                if let Some(msg) = self.messages.get_mut(idx) {
+                    msg.diff = Some(req.diff.clone());
+                }
+            }
+        }
+
+        self.mode = Mode::Chat;
+        self.confirm_scroll = 0;
+        self.status = if approved { "Allowed".into() } else { "Denied".into() };
     }
 }
 
@@ -164,7 +270,7 @@ fn prompt_head(prompt: &str) -> String {
 /// it but a 4000-char body of code is unreadable on a phone anyway.
 fn format_confirm_for_telegram(req: &tools::ConfirmRequest) -> String {
     let mut s = format!(
-        "🔐 hmanlab wants to run a tool that needs your approval:\n\n{}\n",
+        "🔐 Hibiscus wants to run a tool that needs your approval:\n\n{}\n",
         req.prompt
     );
     if !req.diff.is_empty() {

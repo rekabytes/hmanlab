@@ -1,8 +1,8 @@
-<h1 align="center">hmanlab</h1>
+<h1 align="center">Hibiscus</h1>
 
 <p align="center">
   <b>The agentic terminal client for any LLM you have a key for.</b><br>
-  Local Ollama · Cloud Ollama · z.ai · OpenCode Go · hmanlab · OpenRouter · No account required
+  Local Ollama · Cloud Ollama · z.ai · OpenCode Go · Hibiscus · OpenRouter · No account required
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ Prebuilt binaries cover `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`
 
 ## First run
 
-Launch `hmanlab` — no key, no account needed. On first launch, an optional wizard lets you connect a provider:
+Launch `hibiscus` — no key, no account needed. On first launch, an optional wizard lets you connect a provider:
 
 1. **Choose a provider** (all optional — skip everything and add later with `/model`):
    - Local Ollama URL
@@ -48,10 +48,11 @@ Launch `hmanlab` — no key, no account needed. On first launch, an optional wiz
    - Ollama Cloud key
    - OpenCode Go key
    - OpenRouter key
-   - hmanlab key (`sk-…` from [ai.hmanlab.pro](https://ai.hmanlab.pro))
+   - Hibiscus key (`sk-…` from [ai.hmanlab.pro](https://ai.hmanlab.pro))
+   - MiniMax key
 2. **Chat.** That's it.
 
-If you already have Ollama running locally, you can skip the wizard entirely — hmanlab will pick it up automatically if you pass `--host`.
+If you already have Ollama running locally, you can skip the wizard entirely — hibiscus will pick it up automatically if you pass `--host`.
 
 ---
 
@@ -60,7 +61,7 @@ If you already have Ollama running locally, you can skip the wizard entirely —
 ### Chat
 
 - **Streaming replies** — tokens render as they arrive from any provider.
-- **Multi-provider** — local Ollama, Ollama Cloud, z.ai (subscription + usage-based), OpenCode Go, OpenRouter, and hmanlab from one TUI; switch with `/model` or `Ctrl+M`.
+- **Multi-provider** — local Ollama, Ollama Cloud, z.ai (subscription + usage-based), OpenCode Go, OpenRouter, and Hibiscus from one TUI; switch with `/model` or `Ctrl+M`.
 - **Inline markdown** — `**bold**` and `` `code` `` render styled in the chat panel.
 - **Thinking block folding** — `<think>…</think>` reasoning blocks collapse by default; `Ctrl+T` to expand.
 - **Y/N quick-reply** — when the model asks a yes/no question, just press `Y` or `N`.
@@ -69,7 +70,7 @@ If you already have Ollama running locally, you can skip the wizard entirely —
 ### Tools & memory
 
 - **Agentic tool calls** — the model reads files, explores directories, runs git commands, edits/writes files, executes shell commands, and recalls persistent memories. Every destructive action requires your confirmation with a diff preview.
-- **Workspace trust** — on first launch in a new directory, hmanlab asks whether to trust it. Untrusted workspaces allow read-only tools but block destructive ones. Use `/trust` or `/untrust` to change later.
+- **Workspace trust** — on first launch in a new directory, Hibiscus asks whether to trust it. Untrusted workspaces allow read-only tools but block destructive ones. Use `/trust` or `/untrust` to change later.
 - **Persistent memory** — save and recall durable facts across sessions. Two scopes: user-wide (`~/.hmanlab/memory/`) and project-local (`<workspace>/.hmanlab/memory/`).
 - **Auto-compaction** — when the context window fills up, old turns are summarised so the conversation keeps going.
 
@@ -117,7 +118,7 @@ Examples:
 
 ```bash
 # Local Ollama
-hmanlab --host http://192.168.3.3:11434 --model qwen3:8b
+hibiscus --host http://192.168.3.3:11434 --model qwen3:8b
 
 # No flags needed if Ollama is on localhost and a provider key is already saved
 hmanlab
@@ -137,7 +138,6 @@ hmanlab
 | `/load <id-prefix>` | Resume a saved session |
 | `/model` | Open model picker (`Ctrl+M`) |
 | `/model <name>` | Switch model (partial match works) |
-| `/models`, `/ls` | List available models |
 | `/host <url>` | Change Ollama host |
 | `/workspace <path>` | Change agent workspace |
 | `/trust` | Authorise this workspace for file edits & shell |
@@ -198,7 +198,8 @@ Add a BYOK provider with `Ctrl+M` → pick a `+ Add` entry.
 | **z.ai usage-based** | `https://api.z.ai/api/paas/v4` | z.ai dashboard |
 | **OpenCode Go** | `https://opencode.ai/zen/go/v1` | opencode.ai |
 | **OpenRouter** | `https://openrouter.ai/api/v1` | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
-| **hmanlab** | `https://ai.hmanlab.pro/v1` | [ai.hmanlab.pro](https://ai.hmanlab.pro) |
+| **Hibiscus** | `https://ai.hmanlab.pro/v1` | [ai.hmanlab.pro](https://ai.hmanlab.pro) |
+| **MiniMax** | `https://api.minimax.io/v1` | MiniMax dashboard |
 
 Keys are stored in `~/.config/hmanlab/config.json` (mode `0600`) and sent **only** to the matching provider.
 
@@ -207,7 +208,7 @@ Keys are stored in `~/.config/hmanlab/config.json` (mode `0600`) and sent **only
 ## Architecture
 
 ```
-hmanlab (Rust TUI binary)
+Hibiscus (Rust TUI binary)
    │
    ├── Ollama API          local / LAN / Ollama Cloud
    ├── OpenAI-compat       z.ai · OpenCode Go · OpenRouter · hmanlab

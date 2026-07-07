@@ -1,21 +1,25 @@
 //! UI render entry + always-on chrome (header + status bar).
 //!
 //! Each mode-specific surface lives in its own submodule:
-//!   - chat.rs    — message history + input box
-//!   - popups.rs  — model picker, session picker, add-model, confirm
-//!   - markdown.rs — inline markdown parser + word-wrap (shared)
+//!   - chat.rs      — message history + input box
+//!   - popups.rs    — model picker, session picker, add-model, confirm
+//!   - markdown.rs  — inline markdown parser + word-wrap (shared)
+//!   - layout.rs    — 3-pane region builder (sidebar | chat | inspector)
+//!   - inspector.rs — right-column agent dashboard (tool / shell / plan / stats)
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::app::{App, Mode};
 
 mod chat;
+mod inspector;
+mod layout;
 mod markdown;
 mod popups;
 mod sidebar;
@@ -23,176 +27,140 @@ pub(crate) mod theme;
 mod viewer;
 mod wrap_cache;
 
-pub(crate) use sidebar::{initial_expanded, SidebarSnapshot};
-
-/// Sidebar width (incl. its border). Skipped entirely when the terminal is
-/// too narrow to fit it alongside a usable chat column.
-const SIDEBAR_W: u16 = 26;
-const SIDEBAR_MIN_TOTAL_W: u16 = 80;
+pub(crate) use sidebar::initial_expanded;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(6),
-            Constraint::Length(1),
-        ])
-        .split(area);
 
-    render_header(f, chunks[0], app);
-    // On wide terminals, split the middle row into [sidebar | chat]. On
-    // narrow terminals (< 80 cols) the sidebar is dropped so the chat
-    // keeps full width — the input box already needs ~60 cols to be usable.
-    let (chat_area, has_sidebar) = if chunks[1].width >= SIDEBAR_MIN_TOTAL_W {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(SIDEBAR_W), Constraint::Min(40)])
-            .split(chunks[1]);
-        sidebar::render_sidebar(f, cols[0], app);
-        (cols[1], true)
+    // **Critical frame-level wipe.** `Clear` resets every cell's
+    // character AND style (`cell.reset()` → symbol=" ", style=default).
+    // Without this, stale characters from the PREVIOUS frame persist
+    // in the buffer — ratatui's `Block::set_style` only patches style
+    // (bg/fg/modifier) but does NOT clear `cell.symbol`. So overflow
+    // text from a prior render (e.g. expanded thinking that was
+    // collapsed, or a chat line that scrolled away) would remain
+    // visible as ghost characters on the new frame's bg.
+    //
+    // The old code used `Paragraph::new("")` which is a NO-OP — an
+    // empty paragraph has zero lines and paints nothing. This was
+    // the root cause of the "spam Ctrl+T while generating" leak:
+    // stale characters were never wiped between frames.
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(Style::default().bg(theme::color::BG_BASE)),
+        area,
+    );
+
+    let regions = layout::build_regions(f, app);
+
+    render_header(f, regions.header, app);
+
+    // Chat renders FIRST so that its potential overflow (long lines
+    // that bleed past `chat_area`'s edges) lands in the sidebar /
+    // inspector buffer cells BEFORE those panels render. The sidebar
+    // and inspector then `Clear` their own areas (wiping the overflow)
+    // before painting their content. If the chat rendered last, its
+    // overflow would land on top of already-rendered sidebar /
+    // inspector content with nothing to wipe it.
+    if app.open_file.is_some() {
+        viewer::render_viewer(f, regions.chat, app);
     } else {
-        (chunks[1], false)
-    };
-    if !has_sidebar {
-        // Sidebar is hidden — make sure stale geometry from a previous wider
-        // frame can't make sidebar clicks "stick" after a resize.
+        chat::render_chat(f, regions.chat, app);
+    }
+
+    if let Some(sb) = regions.sidebar {
+        sidebar::render_sidebar(f, sb, app);
+    } else {
+        // Sidebar is hidden — wipe stale geometry from a previous wider
+        // frame so a resize doesn't keep catching clicks on a column
+        // that no longer exists.
         app.render.sidebar_x = 0;
         app.render.sidebar_y = 0;
         app.render.sidebar_w = 0;
         app.render.sidebar_h = 0;
         app.render.sidebar_targets.clear();
+        app.render.sidebar_tab_rects.clear();
     }
+
     // Modal popups split the chat column 50/50 — chat shrinks to the
-    // top half, popup occupies the bottom half. Picked over the
-    // older floating-centered overlay so the user can still see the
-    // conversation while picking a model, confirming a tool, watching
-    // the shell, etc. Inline autocomplete is NOT modal (anchored above
-    // the input) so it doesn't take the bottom half.
+    // top half, popup occupies the bottom half. The inspector stays
+    // full-height so the user still sees the agent state during a
+    // picker. **ModelPicker is back to modal** — rendered into the
+    // bottom half of the chat column (its `popup_area` slice), not
+    // floating. Confirm is non-modal (inline card in chat). Inline
+    // autocomplete is NOT modal (anchored above the input).
     let popup_active = matches!(
         app.mode,
         Mode::ModelPicker
-            | Mode::Confirm
             | Mode::AddModel
             | Mode::SessionPicker
             | Mode::DisconnectPicker
             | Mode::TelegramSetup
             | Mode::AgentsSetup
             | Mode::ShellMonitor
+            | Mode::McpSetup
     );
     let (chat_area, popup_area) = if popup_active {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chat_area);
+            .split(regions.chat);
         (split[0], Some(split[1]))
     } else {
-        (chat_area, None)
+        (regions.chat, None)
     };
 
-    // While a file is open the viewer takes the chat column. The chat panel
-    // still keeps its scroll state so closing the viewer returns to exactly
-    // the same conversation view.
-    if app.open_file.is_some() {
-        viewer::render_viewer(f, chat_area, app);
-    } else {
-        chat::render_chat(f, chat_area, app);
+    // Re-render the chat into the (possibly split) chat_area so that
+    // modal popups get the top half. The first chat render (above)
+    // already painted into the full `regions.chat`; this second render
+    // overwrites the top-half portion cleanly because `render_chat`
+    // starts with its own `Clear`.
+    if popup_active {
+        if app.open_file.is_some() {
+            viewer::render_viewer(f, chat_area, app);
+        } else {
+            chat::render_chat(f, chat_area, app);
+        }
     }
-    chat::render_input(f, chunks[2], app);
-    render_status(f, chunks[3], app);
 
-    // Inline autocomplete (slash / @ mention) — render LAST so it floats
-    // above the chat panel without being clipped by it. Anchored just
-    // above the input box.
+    inspector::render_inspector(f, &regions, app);
+    chat::render_input(f, regions.input, app);
+    render_status(f, regions.status, app);
+
     if app.inline_popup.is_open() {
-        popups::render_inline_popup(f, chunks[2], app);
+        popups::render_inline_popup(f, regions.input, app);
     }
 
-    // Modal popups render into the bottom half of the (split) chat
-    // column. They no longer compute their own centered rect — the
-    // outer `popup_area` IS their rect; they fill it edge-to-edge.
     if let Some(p) = popup_area {
         match app.mode {
             Mode::ModelPicker => popups::render_picker(f, p, app),
-            Mode::Confirm => popups::render_confirm(f, p, app),
             Mode::AddModel => popups::render_add_model(f, p, app),
             Mode::SessionPicker => popups::render_session_picker(f, p, app),
             Mode::DisconnectPicker => popups::render_disconnect_picker(f, p, app),
             Mode::TelegramSetup => popups::render_telegram_setup(f, p, app),
             Mode::AgentsSetup => popups::render_agents_setup(f, p, app),
             Mode::ShellMonitor => popups::render_shell_monitor(f, p, app),
-            Mode::Chat => {}
+            Mode::McpSetup => popups::render_mcp_setup(f, p, app),
+            // Confirm renders inline in the chat (see render_chat).
+            Mode::Confirm | Mode::Chat => {}
         }
     }
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let host_short = mask_host(app.current_host());
-    let total_tokens = app.total_prompt_tokens + app.total_completion_tokens;
-    let tokens_label = format_tokens(total_tokens);
-
-    let sep = Span::styled("  •  ", Style::default().fg(theme::color::FG_DIMMER));
-
-    let mut spans = vec![
-        Span::styled(
-            " hmanlab ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme::color::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled("model: ", Style::default().fg(theme::color::FG_DIM)),
-        Span::styled(
-            app.model.as_str(),
-            Style::default()
-                .fg(theme::color::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        sep.clone(),
-        Span::styled("host: ", Style::default().fg(theme::color::FG_DIM)),
-        Span::styled(host_short, Style::default().fg(theme::color::FG)),
-        sep.clone(),
-        Span::styled(
-            format!("tokens: {tokens_label}"),
-            Style::default().fg(theme::color::FG_DIM),
-        ),
-    ];
-
-    // Per-specialist token breakdown — only rendered when `/ask` has
-    // actually been used, so the header stays clean for single-model
-    // sessions. Sorted by name for stable visual order across renders.
-    if !app.agent_token_tally.is_empty() {
-        let mut entries: Vec<(&String, &(u64, u64))> = app.agent_token_tally.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, (p, c)) in entries {
-            spans.push(sep.clone());
-            spans.push(Span::styled(
-                format!("{name}: ", name = name),
-                Style::default().fg(theme::color::FG_DIM),
-            ));
-            spans.push(Span::styled(
-                format!("{}/{}", format_tokens(*p), format_tokens(*c)),
-                Style::default().fg(theme::color::ASSISTANT),
-            ));
-        }
-    }
-
-    // Background update check tagged us — surface the upgrade hint at
-    // the right end of the header so it's visible but never in the way.
-    if let Some(latest) = app.update_available.as_deref() {
-        spans.push(sep);
-        spans.push(Span::styled(
-            format!("v{latest} available — npm i -g hmanlab"),
-            Style::default()
-                .fg(theme::color::SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Header is now empty — the product badge, model, host, and
+    // token counts all live in the inspector pane's top section
+    // (see `ui::inspector::ModelSection`). The header row is kept so
+    // the vertical layout doesn't shift, but it's a no-op render.
+    // If we ever need to put chrome back here, the update-notification
+    // banner is the natural home for it.
+    let _ = app;
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(theme::color::BG_BASE)),
+        area,
+    );
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &mut App) {
@@ -257,7 +225,10 @@ fn render_status(f: &mut Frame, area: Rect, app: &mut App) {
             app.render.shell_indicator_w = indicator_w;
         }
     }
-    f.render_widget(Paragraph::new(Line::from(left_spans)), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(left_spans)).style(Style::default().bg(theme::color::BG_BASE)),
+        chunks[0],
+    );
     let help = Line::from(vec![
         Span::styled("/help", Style::default().fg(theme::color::FG)),
         Span::styled("  ·  ", Style::default().fg(theme::color::FG_DIMMER)),
@@ -273,36 +244,14 @@ fn render_status(f: &mut Frame, area: Rect, app: &mut App) {
         Span::styled("^T", Style::default().fg(theme::color::FG_DIM)),
         Span::styled(" fold ", Style::default().fg(theme::color::FG_DIMMER)),
     ]);
-    f.render_widget(Paragraph::new(help).alignment(Alignment::Right), chunks[1]);
+    f.render_widget(
+        Paragraph::new(help)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(theme::color::BG_BASE)),
+        chunks[1],
+    );
 }
 
-/// Strip scheme and port from the configured host URL — `http://192.168.3.3:11434`
-/// becomes `192.168.3.3`. Keeps the underlying connection URL intact in `app.client.base`.
-fn mask_host(base: &str) -> String {
-    let no_scheme = base
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let no_path = no_scheme.split('/').next().unwrap_or(no_scheme);
-    // IPv6 literals use brackets: `[::1]:port`. Strip from `]` onward, keep brackets.
-    if no_path.starts_with('[') {
-        if let Some(close) = no_path.find(']') {
-            return no_path[..=close].to_string();
-        }
-    }
-    // For everything else, drop the port if present.
-    match no_path.rfind(':') {
-        Some(i) => no_path[..i].to_string(),
-        None => no_path.to_string(),
-    }
-}
-
-/// Render a token count compactly: 832 → "832", 12345 → "12.3k", 1_500_000 → "1.5M".
-fn format_tokens(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
-}
+// `mask_host` and `format_tokens` used to live here for the header.
+// They moved to `ui::inspector::short_host` / `format_tokens` when the
+// model/host/token block moved to the right panel.

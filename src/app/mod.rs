@@ -22,7 +22,9 @@ pub mod event;
 mod heuristics;
 pub mod inline;
 mod input;
-mod state;
+pub mod mcp_providers;
+mod plan;
+pub mod state;
 mod stream;
 mod stream_msg;
 mod viewer;
@@ -31,8 +33,9 @@ pub mod workspace;
 pub use backend::LlmBackend;
 pub use inline::{InlinePopup, SLASH_COMMANDS};
 pub use state::{
-    AgentsSetupStep, AppAction, DisconnectEntry, Mode, ModelPickerLevel, ModelRow, PageState,
-    Picker, ProviderRow, RenderState, ShellRuntime, TelegramSetupStep, TurnState,
+    AgentsSetupStep, AppAction, DisconnectEntry, McpSetupScreen, Mode, ModelPickerLevel,
+    ModelRow, PageState, Picker, ProviderRow, RenderState, ShellRuntime, TelegramSetupStep,
+    TurnState,
 };
 pub use stream_msg::StreamMsg;
 pub use viewer::OpenFile;
@@ -201,13 +204,24 @@ pub struct App {
     /// scroll-triggered auto-loads; `Exhausted` short-circuits the
     /// auto-loader after the server confirmed there's nothing older.
     pub page_state: PageState,
-    /// Indices of tool messages currently shown expanded. Tool messages collapse
-    /// by default to keep the chat readable; Ctrl+T toggles all of them.
+    /// Per-message expand state for tool-result tiles. The chat renderer
+    /// shows a tool tile as a one-line header card (`📖 read_file · …  ⌄`)
+    /// by default and only inlines the full output if the message index
+    /// is in this set. Click a tile in the chat to toggle. The default
+    /// collapsed behaviour is intentional — multi-tool turns would
+    /// otherwise drown the column in raw output. Mirrors the field name
+    /// the previous fold/expand design used (kept for compatibility with
+    /// the `card_row_targets` docstring in `state.rs`).
     pub expanded_tools: HashSet<usize>,
-    /// Indices of assistant messages whose `<think>` reasoning block is shown
-    /// expanded. Like `expanded_tools`, collapsed by default. Ctrl+T toggles
-    /// these alongside tool blocks; clicking a thinking row toggles just one.
-    pub expanded_thoughts: HashSet<usize>,
+    /// Start indices of multi-tool groups the user has clicked to
+    /// expand. Distinct from `expanded_tools` (which tracks per-tile
+    /// body expansion for single tools) because a multi-tool group has
+    /// a different expand affordance: clicking the grouped tile or the
+    /// `▼ N tools expanded` header reveals every member's tile + body
+    /// inline, not just one. The renderer populates
+    /// `RenderState::multi_group_starts` each frame so the click handler
+    /// knows which set to toggle for a given row.
+    pub expanded_tool_groups: HashSet<usize>,
     /// In-app text selection (since we capture the mouse to get an arrow cursor,
     /// native drag-select is disabled — we re-implement it).
     pub sel_start: Option<(u16, u16)>,
@@ -233,6 +247,24 @@ pub struct App {
     /// `Some` between the `ToolStart` and matching `ToolResult` stream events.
     /// Used by the renderer to apply the breathing style to the running row.
     pub active_tool_msg_idx: Option<usize>,
+    /// Wall-clock timestamp of the current in-flight tool call. Stamped in
+    /// `on_tool_start`, cleared in `on_tool_result`. Drives the
+    /// "elapsed 4.2s" counter on the inspector pane — `active_tool_msg_idx`
+    /// alone can't tell us how long a tool has been running.
+    pub active_tool_started_at: Option<std::time::Instant>,
+    /// Plan / todo list as last parsed from the assistant's most recent
+    /// markdown. Each item is `(text, state)` where state is pending /
+    /// active / done. The inspector renders this as a checklist; the
+    /// plan auto-clears when the user sends the next message (see
+    /// `state.rs::clear_plan_on_submit`).
+    pub plan: Vec<crate::app::state::PlanItem>,
+    /// Which sidebar tab is active. Default is `Files` — the legacy
+    /// workspace tree. Sessions lists saved JSONL files for the current
+    /// workspace (uses `local_session_summaries`); Agents lists the
+    /// configured specialist roster. Tab strip at the top of the
+    /// sidebar column is clickable; future keymap bindings (e.g.
+    /// Ctrl+1/2/3) would dispatch here.
+    pub active_sidebar_tab: crate::app::state::SidebarTab,
     /// In-flight (or just-finished) shell command + its streamed output.
     /// `Some` from `ShellStart` until either the user dismisses the
     /// monitor after `ShellDone`, or a fresh `ShellStart` evicts it.
@@ -248,15 +280,11 @@ pub struct App {
     /// pre-seeded so the walker can use a single membership check at every
     /// level. Cleared and re-seeded on `/workspace`.
     pub expanded_dirs: HashSet<PathBuf>,
-    /// Logical-line scroll offset for the sidebar (0 = top). Clamped to a
-    /// valid range each frame by the renderer.
+    /// Logical-line scroll offset for the sidebar (0 = top). Currently
+    /// only matters when the Sessions tab overflows the visible area;
+    /// reserved so future additions (file-tree view, agent log)
+    /// inherit the same scroll plumbing without an App-shape change.
     pub sidebar_scroll: u16,
-    /// Cached output of the last sidebar `walk` pass. The renderer
-    /// rebuilds it only when `(expanded_dirs, workspace,
-    /// workspace_trusted)` changes — otherwise this is reused frame-to-
-    /// frame so we don't pay a sync `read_dir` per expanded directory
-    /// on every redraw. Opaque to App; ui::sidebar owns the structure.
-    pub sidebar_snapshot: Option<crate::ui::SidebarSnapshot>,
     pub update_available: Option<String>,
     /// Inline autocomplete popup overlaying the chat surface, if any.
     /// `Slash` when the user is typing `/<command>`, `File` when they're
@@ -306,6 +334,9 @@ pub struct App {
     /// "not idle" so we don't blast a notification on boot). Stamped in
     /// `handle_event`'s key arm.
     pub last_keypress_at: Option<std::time::Instant>,
+    // NOTE: `last_fold_toggle_at` removed when tool / thinking fold
+    // toggling was stripped from the chat renderer. Re-introduce if we
+    // re-add the debounce alongside any future redesign.
     /// Which step of the `/telegram` wizard is showing while
     /// `mode == Mode::TelegramSetup`. Ignored otherwise.
     pub telegram_setup_step: TelegramSetupStep,
@@ -380,6 +411,25 @@ pub struct App {
     /// `ChatMessage` in `start_turn`; cleared on `/clear`, `/new`,
     /// and `cancel`. Not persisted to disk — re-attach if reloading.
     pub pending_attachments: Vec<Attachment>,
+
+    // ── MCP / web-search ────────────────────────────────────────────────
+    /// Which search provider is currently active, if any. Mirrors
+    /// `Config::mcp_active_provider` and is set from that at startup,
+    /// then kept up to date by the `/mcp` modal on save.
+    pub mcp_active_provider: Option<String>,
+    /// API keys for MCP providers that require them, keyed by provider id
+    /// (e.g. `"brave"` → `"BSA..."`). Parallel and Exa (basic tier) need
+    /// no key and will never appear here.
+    pub mcp_keys: std::collections::HashMap<String, String>,
+    /// Which screen of the `/mcp` wizard is active. Ignored unless
+    /// `mode == Mode::McpSetup`.
+    pub mcp_setup_screen: crate::app::state::McpSetupScreen,
+    /// Cursor position within the provider list (Screen 1).
+    pub mcp_setup_index: usize,
+    /// Free-text input for the API key (Screen 2). Reset on every modal open.
+    pub mcp_setup_input: tui_textarea::TextArea<'static>,
+    /// Validation error shown under the key input. Cleared on each keystroke.
+    pub mcp_setup_error: Option<String>,
 }
 
 /// Wizard scratch — what the user has typed across the four steps. On
@@ -491,8 +541,6 @@ impl App {
             local_session_meta_written: false,
             local_session_summaries: Vec::new(),
             page_state: PageState::Idle,
-            expanded_tools: HashSet::new(),
-            expanded_thoughts: HashSet::new(),
             sel_start: None,
             sel_end: None,
             selecting: false,
@@ -502,11 +550,15 @@ impl App {
             last_prompt_tokens: 0,
             anim_tick: 0,
             active_tool_msg_idx: None,
+            active_tool_started_at: None,
+            plan: Vec::new(),
+            active_sidebar_tab: crate::app::state::SidebarTab::Sessions,
             active_shell: None,
             open_file: None,
             expanded_dirs: HashSet::new(),
+            expanded_tools: HashSet::new(),
+            expanded_tool_groups: HashSet::new(),
             sidebar_scroll: 0,
-            sidebar_snapshot: None,
             update_available: None,
             inline_popup: InlinePopup::None,
             pending_settings_msg_idx: None,
@@ -535,6 +587,12 @@ impl App {
             agents_setup_error: None,
             active_specialist: None,
             pending_attachments: Vec::new(),
+            mcp_active_provider: None,
+            mcp_keys: std::collections::HashMap::new(),
+            mcp_setup_screen: McpSetupScreen::ProviderList,
+            mcp_setup_index: 0,
+            mcp_setup_input: fresh_textarea(),
+            mcp_setup_error: None,
         }
     }
 }

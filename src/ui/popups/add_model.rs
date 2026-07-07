@@ -86,14 +86,25 @@ pub(in crate::ui) fn render_add_model(f: &mut Frame, area: Rect, app: &mut App) 
                     .to_string(),
             ),
             p if p == crate::config::HMANLAB_PROVIDER => (
-                " add hmanlab key ".to_string(),
-                "Paste your hmanlab API key (generate one at \
-                     https://ai.hmanlab.pro). After saving, the hmanlab-served \
+                " add Hibiscus key ".to_string(),
+                "Paste your Hibiscus API key (generate one at \
+                     https://ai.hmanlab.pro). After saving, the Hibiscus-served \
                      models become selectable in /model.\n\n\
                      Models available: claude-sonnet-4-6, claude-opus-4-8, \
                      claude-opus-4-7, claude-haiku-4-5, gpt-5.5, gpt-5.4.\n\n\
                      The key is stored in ~/.config/hmanlab/config.json (mode \
                      0600) and only sent to ai.hmanlab.pro."
+                    .to_string(),
+            ),
+            p if p == crate::config::MINIMAX_PROVIDER => (
+                " add MiniMax key ".to_string(),
+                "Paste your MiniMax API key (generate one at \
+                     https://api.minimax.io). After saving, the MiniMax-served \
+                     models become selectable in /model.\n\n\
+                     Models available: MiniMax-M3, M2.7, M2.6. Default is \
+                     MiniMax-M3.\n\n\
+                     The key is stored in ~/.config/hmanlab/config.json (mode \
+                     0600) and only sent to api.minimax.io."
                     .to_string(),
             ),
             _ => (

@@ -138,9 +138,23 @@ async fn main() -> Result<()> {
     if let Some(k) = saved2.hmanlab_api_key.clone() {
         app.set_byok_key(config::HMANLAB_PROVIDER, k);
     }
+    if let Some(k) = saved2.minimax_api_key.clone() {
+        app.set_byok_key(config::MINIMAX_PROVIDER, k);
+    }
     app.extra_models = saved2.extra_models.clone();
     app.telegram_notify_on_idle = saved2.telegram_notify_on_idle;
     app.agents = saved2.agents.clone();
+    // MCP web-search provider
+    app.mcp_active_provider = saved2.mcp_active_provider.clone();
+    if let Some(k) = saved2.brave_search_api_key.clone() {
+        app.mcp_keys.insert("brave".into(), k);
+    }
+    if let Some(k) = saved2.exa_api_key.clone() {
+        app.mcp_keys.insert("exa".into(), k);
+    }
+    if let Some(k) = saved2.tavily_api_key.clone() {
+        app.mcp_keys.insert("tavily".into(), k);
+    }
     app.trusted_workspaces = saved2
         .trusted_workspaces
         .iter()

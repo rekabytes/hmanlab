@@ -136,12 +136,41 @@ pub(super) fn wrap_styled_segments(
             }
             Tok::Word(text, style) => {
                 let len = text.chars().count();
-                if col + len > width && col > 0 {
+                if len > width {
+                    // Single word longer than the wrap width — without
+                    // intervention it would overflow the chat column
+                    // and bleed into the adjacent inspector panel.
+                    // Hard-break it at `width` chars (joined with no
+                    // hyphen; this is rare content like long paths
+                    // / URLs from tool output, not prose).
+                    if col > 0 {
+                        lines.push(vec![]);
+                        col = 0;
+                    }
+                    let chars: Vec<char> = text.chars().collect();
+                    for chunk in chars.chunks(width) {
+                        let piece: String = chunk.iter().collect();
+                        let piece_len = chunk.len();
+                        if col > 0 {
+                            lines.push(vec![]);
+                            col = 0;
+                        }
+                        lines.last_mut().unwrap().push(Span::styled(piece, style));
+                        col += piece_len;
+                        if col >= width {
+                            lines.push(vec![]);
+                            col = 0;
+                        }
+                    }
+                } else if col + len > width && col > 0 {
                     lines.push(vec![]);
                     col = 0;
+                    lines.last_mut().unwrap().push(Span::styled(text, style));
+                    col += len;
+                } else {
+                    lines.last_mut().unwrap().push(Span::styled(text, style));
+                    col += len;
                 }
-                lines.last_mut().unwrap().push(Span::styled(text, style));
-                col += len;
             }
         }
     }
@@ -149,5 +178,55 @@ pub(super) fn wrap_styled_segments(
     if lines.last().is_some_and(|l| l.is_empty()) && lines.len() > 1 {
         lines.pop();
     }
+
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_styled_segments;
+    use ratatui::style::Style;
+
+    #[test]
+    fn single_long_word_is_hard_broken() {
+        // 60-char word in a 20-col wrap width — must split across
+        // multiple lines, never overflow a single line.
+        let long = "a".repeat(60);
+        let lines = wrap_styled_segments(
+            vec![(long.clone(), Style::default())],
+            20,
+        );
+        for line in &lines {
+            assert!(
+                line.iter().map(|s| s.content.chars().count()).sum::<usize>() <= 20,
+                "overflowing line: {:?}",
+                line,
+            );
+        }
+        // Reassembled text == input (no chars lost, just split).
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.clone()))
+            .collect();
+        assert_eq!(joined, long);
+    }
+
+    #[test]
+    fn normal_sentence_still_wraps_at_word_boundaries() {
+        let lines = wrap_styled_segments(
+            vec![("hello world this is a test".to_string(), Style::default())],
+            10,
+        );
+        // Each line should be <= 10 chars and contain whole words.
+        for line in &lines {
+            assert!(line.iter().map(|s| s.content.chars().count()).sum::<usize>() <= 10);
+        }
+        // Reassembled content should contain all the input words.
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(joined.contains("hello") && joined.contains("world") && joined.contains("test"));
+    }
 }

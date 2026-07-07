@@ -52,7 +52,7 @@ impl App {
     pub(super) fn on_update_result(&mut self, ok: bool, text: String) {
         self.push_info(text);
         self.status = if ok {
-            "Update finished — restart hmanlab to use the new version".into()
+            "Update finished — restart Hibiscus to use the new version".into()
         } else {
             "Update failed".into()
         };

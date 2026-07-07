@@ -263,6 +263,8 @@ impl App {
                 tx,
                 tool_defs,
                 Vec::new(),
+                None, // /ask specialists don't get MCP web-search
+                std::collections::HashMap::new(),
             )
             .await;
         });

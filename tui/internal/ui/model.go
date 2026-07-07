@@ -526,10 +526,12 @@ func (m *Model) cancelStream(markCancelled bool) {
 // resize. Height split (top → bottom):
 //
 //	header (1) + viewport (rest) + input (3 — textarea only, no
-//	border) + status (1).
+//	border) + status (1) + bottom (1).
 //
-// The textarea's width accounts for the hibiscus left beam (2 cols)
-// plus 1 col of breathing room after it.
+// The bottom row is breathing room — without it the status bar /
+// /help hint sits on the terminal's very last row and reads as
+// crammed. One extra row of BGBase under the status bar lifts the
+// whole footer up by a line and makes the layout feel less tight.
 func (m *Model) relayout() {
 	if m.width < 10 || m.height < 10 {
 		return
@@ -538,8 +540,9 @@ func (m *Model) relayout() {
 		headerH = 1
 		inputH  = 3 // textarea only — no border, beam lives outside
 		statusH = 1
+		bottomH = 1 // breathing room under status bar
 	)
-	vpH := m.height - headerH - inputH - statusH
+	vpH := m.height - headerH - inputH - statusH - bottomH
 	if m.mode == ModeChat {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpH
@@ -608,6 +611,7 @@ func (m Model) viewChat() string {
 	rightHeader := modelStyle.Render(fmt.Sprintf("○ %s", m.model))
 	middle := strings.Repeat(" ", max(0, m.width-lipgloss.Width(leftHeader)-lipgloss.Width(rightHeader)))
 	header := lipgloss.NewStyle().
+		Width(m.width).
 		Background(theme.BGBase).
 		Render(leftHeader + middle + rightHeader)
 
@@ -633,6 +637,13 @@ func (m Model) viewChat() string {
 		m.input.View(),
 	)
 	inputBlock := lipgloss.NewStyle().
+		// Width(m.width) forces the wrapper to span the full row so
+		// BG_CHAT fills the entire input area — even when the textarea
+		// is empty (bubbles/textarea only renders bg on cells it
+		// actually outputs, so without Width() the right portion of
+		// the row reverts to whatever was rendered beneath). Content
+		// (beam + space + textarea) stays left-aligned.
+		Width(m.width).
 		Background(theme.BGChat).
 		Render(inputRow)
 
@@ -679,15 +690,26 @@ func (m Model) viewChat() string {
 	leftGap := gapTotal / 2
 	rightGap := gapTotal - leftGap
 	statusBlock := lipgloss.NewStyle().
+		Width(m.width).
 		Background(theme.BGBase).
 		Foreground(theme.FG).
 		Render(" " + statusLeft + strings.Repeat(" ", leftGap) + statusMid + strings.Repeat(" ", rightGap) + statusRight + " ")
+
+	// Bottom padding row — full-width blank BGBase strip one row tall.
+	// Without this the status bar's footer text sits on the terminal's
+	// very last row, reading as crammed. One row of BGBase lifts the
+	// whole footer up visually and ends the layout on a clean break.
+	bottomBlock := lipgloss.NewStyle().
+		Width(m.width).
+		Background(theme.BGBase).
+		Render(strings.Repeat(" ", m.width))
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		m.viewport.View(),
 		inputBlock,
 		statusBlock,
+		bottomBlock,
 	)
 }
 

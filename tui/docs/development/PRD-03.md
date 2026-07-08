@@ -24,8 +24,9 @@ Three features, each complete end-to-end:
   continues until it produces a final text reply. Up to 50 tool-call
   rounds per turn. Tools run sequentially within a batch.
 - **Multi-tool grouping.** Consecutive tool calls collapse into compact
-  tiles: `⚡⚡⚡ 3 reads`, `⚡×5 5 edits`, `⚡ shell · read` (mixed).
-  Expandable to show individual results. Live progress while tools run.
+  tiles with a single `✿` flower mark: `✿ 3 reads`, `✿ 5 edits`,
+  `✿ 3 calls · read 2 · shell 1` (mixed). Expandable to show individual
+  results. Live progress while tools run.
 - **Compaction.** When context exceeds 24k tokens, the TUI summarizes
   old messages into a bullet-list briefing, replaces visible history
   with the summary, and continues. Triggered automatically before a
@@ -57,10 +58,11 @@ attachments. Those land in PRD-04+.
 - `MAX_TURNS = 50` — hard cap on tool-call rounds.
 
 ### Multi-tool grouping UI
-- Consecutive `role: "tool"` messages collapse into a single tile.
-- Uniform groups: `⚡⚡⚡ 3 reads` (≤3 bolts) or `⚡×10 10 reads` (>3).
-- Mixed groups: `⚡×3 3 calls · read 2 · shell 1`.
-- Live progress while tools run: `⚡⚡▫ reading files … ▰▰▱ 2/3`.
+- Consecutive `role: "tool"` messages collapse into a single tile
+  with one `✿` flower mark (not repeated bolts).
+- Uniform groups: `✿ 3 reads`, `✿ 10 reads`.
+- Mixed groups: `✿ 3 calls · read 2 · shell 1`.
+- Live progress while tools run: `✿ reading files … ▰▰▱ 2/3`.
 - Expandable (chevron ⌄) to show per-tool details.
 - Recomputed every render frame (pure function over message list).
 
@@ -271,12 +273,14 @@ func SummarizeGroup(messages []chatMessage, g ToolGroup) GroupSummary
 Any non-tool message breaks a run.
 
 **Tile rendering** (`tool_tile.go`):
-- ≤3 tools: `⚡` repeated (⚡, ⚡⚡, ⚡⚡⚡)
-- >3 tools: `⚡×N`
-- Uniform: `⚡⚡⚡ 3 reads`
-- Mixed: `⚡×3 3 calls · read 2 · shell 1`
-- In-flight: `⚡⚡▫ reading files … ▰▰▱ 2/3`
+- Single `✿` flower mark (not repeated — one flower regardless of count)
+- Uniform: `✿ 3 reads`
+- Mixed: `✿ 3 calls · read 2 · shell 1`
+- In-flight: `✿ reading files … ▰▰▱ 2/3`
 - Expandable: chevron ⌄ reveals individual tool rows
+- Animations: progress bar (▰▰▱▱▱ fills over 6s), breathing count
+  (`2/3` pulses), animated ellipsis (`.` `..` `...` ` `), hibiscus
+  color pulse on the flower mark while tools run
 
 ### Compaction design
 
@@ -412,11 +416,11 @@ arrives.
 │                                             │
 │  ✿ hibiscus                                 │
 │  Let me look at the file…                   │
-│  ⚡ read main.go                             │
+│  ✿ read main.go                             │
 │                                             │
 │  ✿ hibiscus                                 │
 │  I see the bug. Let me fix it.              │
-│  ⚡ edit main.go                             │
+│  ✿ edit main.go                             │
 │  ┌─ Confirm ─────────────────────────────┐ │
 │  │ Edit main.go                           │ │
 │  │ - fmt.Println("hello")                 │ │
@@ -520,10 +524,10 @@ Phase 3 ships when **all** of these are true:
 - [ ] MAX_TURNS (50) cap works — agent stops with an error message.
 
 ### Tool grouping
-- [ ] 3 consecutive `read_file` calls render as `⚡⚡⚡ 3 reads`.
-- [ ] 5+ calls render as `⚡×5 5 reads`.
-- [ ] Mixed tools render as `⚡×3 3 calls · read 2 · shell 1`.
-- [ ] In-flight tools show progress: `⚡⚡▫ reading files … 2/3`.
+- [ ] 3 consecutive `read_file` calls render as `✿ 3 reads`.
+- [ ] 5+ calls render as `✿ 5 reads`.
+- [ ] Mixed tools render as `✿ 3 calls · read 2 · shell 1`.
+- [ ] In-flight tools show progress: `✿ reading files … 2/3`.
 - [ ] Tiles expand to show individual tool results.
 
 ### Compaction

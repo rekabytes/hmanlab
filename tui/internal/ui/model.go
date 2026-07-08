@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -97,6 +98,7 @@ func New(cfg *config.Config) Model {
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.SetHeight(3)
+	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("enter", "alt+enter", "ctrl+m"))
 	// Match the textarea's own backgrounds to the input-area wrapper
 	// (BG_CHAT) so the beam + textarea read as one continuous surface
 	// instead of two stacked boxes. The cursor line stays unstyled so

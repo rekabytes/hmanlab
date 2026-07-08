@@ -19,6 +19,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -80,6 +81,17 @@ type Model struct {
 	sessionList    []session.SessionSummary
 	sessionCursor  int
 	sessionOverlay bool
+
+	// Model picker overlay state (toggled by /model with no arg).
+	modelEntries []modelEntry
+	modelCursor  int
+	modelOverlay bool
+
+	// API key input modal — opened when selecting an unconfigured
+	// provider from the model picker.
+	keyInputProvider string
+	keyInputActive   bool
+	keyInput         textinput.Model
 
 	// Slash command autocomplete dropdown state. Shows when the input
 	// starts with "/" and no space has been typed yet.
@@ -184,6 +196,13 @@ func New(cfg *config.Config, cwd string) Model {
 
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
+
+	ki := textinput.New()
+	ki.Prompt = ""
+	ki.Placeholder = "Paste your API key"
+	ki.CharLimit = 256
+	ki.EchoMode = textinput.EchoPassword
+
 	m := Model{
 		cfg:          cfg,
 		cwd:          cwd,
@@ -191,6 +210,7 @@ func New(cfg *config.Config, cwd string) Model {
 		viewport:     vp,
 		followTail:   true,
 		mode:         ModeLoading,
+		keyInput:     ki,
 	}
 
 	return m
@@ -218,13 +238,21 @@ func (m *Model) finishLoading() {
 // to ModeChat. Used both at startup (when a key is already configured)
 // and after the connect modal successfully validates a freshly entered key.
 func (m *Model) bootIntoChat() {
-	m.provider = llm.NewCloudOllama(m.cfg.OllamaCloudAPIKey)
 	m.model = m.cfg.EffectiveModel()
+	if m.cfg.LastProvider == "" {
+		m.cfg.LastProvider = config.OllamaCloudProvider
+	}
+	m.provider = llm.BackendFor(m.cfg, m.cfg.LastProvider)
+	if m.provider == nil {
+		// Fallback: try Ollama Cloud.
+		m.provider = llm.NewCloudOllama(m.cfg.OllamaCloudAPIKey)
+		m.cfg.LastProvider = config.OllamaCloudProvider
+	}
 	m.mode = ModeChat
 	m.statusLine = "ready"
 	m.refreshSidebar()
 	m.history = []chatMessage{
-		infoLine(fmt.Sprintf("Connected to **Ollama Cloud** (%s). Try /help for commands.", m.model)),
+		infoLine(fmt.Sprintf("Connected to **%s** (%s). Try /help for commands.", config.ProviderLabel(m.cfg.LastProvider), m.model)),
 	}
 }
 
@@ -328,6 +356,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Success — persist key + boot into chat.
 		m.cfg.OllamaCloudAPIKey = strings.TrimSpace(m.connect.input.Value())
+		m.cfg.LastProvider = config.OllamaCloudProvider
 		if err := m.cfg.Save(); err != nil {
 			// Non-fatal — key still works for this session, just won't
 			// be remembered. Surface as a one-off system message in
@@ -410,6 +439,14 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Session picker overlay intercepts all keys while open.
 	if m.sessionOverlay {
 		return m.updateSessionOverlay(msg)
+	}
+	// Model picker overlay intercepts all keys while open.
+	if m.modelOverlay {
+		return m.updateModelOverlay(msg)
+	}
+	// Key input modal intercepts all keys while open.
+	if m.keyInputActive {
+		return m.updateKeyInput(msg)
 	}
 	switch k := msg.(type) {
 	case tea.KeyMsg:
@@ -543,8 +580,8 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd1, cmd2 tea.Cmd
 	m.input, cmd1 = m.input.Update(msg)
 	m.viewport, cmd2 = m.viewport.Update(msg)
-	m.relayout()            // grow/shrink textarea with content
-	m.refreshCmdDropdown()  // show/hide slash-command autocomplete
+	m.refreshCmdDropdown() // update dropdown state FIRST
+	m.relayout()           // THEN relayout with correct dropdownH
 	return m, tea.Batch(cmd1, cmd2)
 }
 
@@ -669,29 +706,37 @@ func (m Model) handleSlashCommand(cmd slashCommand) (tea.Model, tea.Cmd) {
 	case "model":
 		arg := strings.TrimSpace(cmd.arg)
 		if arg == "" {
-			m.history = append(m.history, infoLine(fmt.Sprintf("Current model: %s", m.model)))
+			// Open the model picker overlay.
+			m.modelEntries = m.buildModelList()
+			m.modelCursor = 0
+			m.modelOverlay = true
 			m.input.Reset()
-			m.refreshViewportContent()
 			return m, nil
 		}
-		// Validate against the Ollama Cloud catalog.
-		valid := false
-		for _, name := range m.provider.Models() {
-			if name == arg {
-				valid = true
+		// Validate against all configured providers' catalogs.
+		var foundProvider string
+		for _, p := range m.cfg.ConfiguredProviders() {
+			for _, name := range config.ProviderModels(p) {
+				if name == arg {
+					foundProvider = p
+					break
+				}
+			}
+			if foundProvider != "" {
 				break
 			}
 		}
-		if !valid {
-			m.history = append(m.history, infoLine(fmt.Sprintf(
-				"✕ unknown model %q. Valid: %s",
-				arg, strings.Join(m.provider.Models()[:min(8, len(m.provider.Models()))], ", ")+", …",
-			)))
+		if foundProvider == "" {
+			m.history = append(m.history, infoLine(fmt.Sprintf("✕ unknown model %q. Use /model to see available models.", arg)))
 		} else {
 			m.model = arg
 			m.cfg.LastModel = arg
+			m.cfg.LastProvider = foundProvider
 			_ = m.cfg.Save()
-			m.history = append(m.history, infoLine(fmt.Sprintf("✓ switched to %s", arg)))
+			if backend := llm.BackendFor(m.cfg, foundProvider); backend != nil {
+				m.provider = backend
+			}
+			m.history = append(m.history, infoLine(fmt.Sprintf("✓ switched to %s (%s)", arg, config.ProviderLabel(foundProvider))))
 		}
 		m.input.Reset()
 		m.followTail = true
@@ -996,6 +1041,59 @@ func (m Model) updateSessionOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateModelOverlay handles keys while the /model picker is open.
+func (m Model) updateModelOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.modelOverlay = false
+		return m, nil
+	case tea.KeyUp:
+		if m.modelCursor > 0 {
+			m.modelCursor--
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.modelCursor < len(m.modelEntries)-1 {
+			m.modelCursor++
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if m.modelCursor < len(m.modelEntries) {
+			e := m.modelEntries[m.modelCursor]
+			if !e.configured {
+				// Open key input modal for this provider.
+				m.keyInputProvider = e.provider
+				m.keyInputActive = true
+				m.modelOverlay = false
+				m.input.Blur()
+				m.keyInput.Placeholder = "Paste your API key for " + config.ProviderLabel(e.provider)
+				m.keyInput.SetValue("")
+				m.keyInput.Focus()
+				return m, textinput.Blink
+			}
+			m.model = e.model
+			m.cfg.LastModel = e.model
+			m.cfg.LastProvider = e.provider
+			_ = m.cfg.Save()
+			// Switch the backend to the selected provider.
+			if backend := llm.BackendFor(m.cfg, e.provider); backend != nil {
+				m.provider = backend
+			}
+			m.history = append(m.history, infoLine(fmt.Sprintf(
+				"✓ switched to %s (%s)", e.model, config.ProviderLabel(e.provider))))
+		}
+		m.modelOverlay = false
+		m.followTail = true
+		m.refreshViewportContent()
+		return m, nil
+	}
+	return m, nil
+}
+
 // relayout recomputes viewport + input dimensions after a window
 // resize or input change. The textarea grows with content up to 15
 // lines, then scrolls internally. Height split (top → bottom):
@@ -1028,7 +1126,9 @@ func (m *Model) relayout() {
 	if m.cmdDropdown && len(m.cmdMatches) > 0 {
 		dropdownH = len(m.cmdMatches)
 	}
-	vpH := m.height - headerH - inputH - statusH - bottomH - gapH - dropdownH
+	// -1 safety margin so the terminal doesn't scroll and push the
+	// header off the top.
+	vpH := m.height - headerH - inputH - statusH - bottomH - gapH - dropdownH - 1
 	if vpH < 3 {
 		vpH = 3
 	}
@@ -1084,6 +1184,10 @@ func (m Model) View() string {
 		view := m.viewChat()
 		if m.sessionOverlay {
 			view = renderSessionOverlay(m.width, m.height, m.sessionList, m.sessionCursor)
+		} else if m.modelOverlay {
+			view = renderModelOverlay(m.width, m.height, m.modelEntries, m.modelCursor, m.model)
+		} else if m.keyInputActive {
+			view = renderKeyInputModal(m.width, m.height, m.keyInputProvider, m.keyInput)
 		}
 		return view
 	}
@@ -1173,7 +1277,8 @@ func (m Model) viewChat() string {
 	} else {
 		dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
 	}
-	statusLeft := fmt.Sprintf("%s ollama-cloud · %s", dot, m.model)
+	providerLabel := config.ProviderLabel(m.cfg.LastProvider)
+	statusLeft := fmt.Sprintf("%s %s · %s", dot, providerLabel, m.model)
 	if m.activeSession != nil {
 		sid := m.activeSession.SessionID
 		if len(sid) > 8 {

@@ -38,13 +38,6 @@ func (m Model) renderSidebar() string {
 		Background(theme.BGBase).
 		Render(fmt.Sprintf(" %s %s", mark, sessTitle))
 
-	// ── Section label ────────────────────────────────────────────
-	labelRow := lipgloss.NewStyle().
-		Foreground(theme.HibiscusGlow).
-		Width(w).
-		Background(theme.BGBase).
-		Render(" sessions")
-
 	sep := lipgloss.NewStyle().
 		Foreground(theme.HibiscusDim).
 		Width(w).
@@ -52,8 +45,8 @@ func (m Model) renderSidebar() string {
 		Render(strings.Repeat("─", w))
 
 	// ── Session list ─────────────────────────────────────────────
-	// Fixed rows: header(1) + label(1) + sep(1) + sep(1) + footer(4) = 8.
-	fixedH := 8
+	// Fixed rows: header(1) + sep(1) + sep(1) + footer(4) = 7.
+	fixedH := 7
 	listH := h - fixedH
 	if listH < 2 {
 		listH = 2
@@ -137,7 +130,6 @@ func (m Model) renderSidebar() string {
 	// ── Assemble ─────────────────────────────────────────────────
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		headerRow,
-		labelRow,
 		sep,
 		strings.Join(listRows, "\n"),
 		sep,

@@ -9,20 +9,12 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/hmanlab/hmanlab/tui/internal/config"
 	"github.com/hmanlab/hmanlab/tui/internal/ui"
 )
 
 func main() {
-	// Prevent lipgloss/termenv from sending an OSC 11 background-color
-	// query to the terminal. The query's response leaks a stray "\"
-	// (the ST terminator's backslash) into Bubble Tea's input reader,
-	// which lands in the textarea. Setting this explicitly skips the
-	// query entirely — no response, no leak.
-	lipgloss.SetHasDarkBackground(true)
-
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hmanlab-tui: load config: %v\n", err)

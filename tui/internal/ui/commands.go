@@ -66,7 +66,7 @@ Current model: %s
 
 **Keys**
 - Enter            Send message
-- Shift+Enter      New line (in input box)
+- Alt+Enter        New line (in input box)
 - Ctrl+C           Cancel in-flight response / exit on empty input
 - PgUp / PgDn      Scroll chat history
 - mouse wheel      Scroll chat history

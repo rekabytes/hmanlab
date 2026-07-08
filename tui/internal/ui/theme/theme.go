@@ -89,7 +89,7 @@ func RoleLabelStyle(role string) lipgloss.Style {
 	case "user":
 		return lipgloss.NewStyle().Foreground(User).Bold(true)
 	case "assistant":
-		return lipgloss.NewStyle().Foreground(Assistant).Bold(true)
+		return lipgloss.NewStyle().Foreground(Hibiscus).Bold(true)
 	case "info", "summary":
 		return lipgloss.NewStyle().Foreground(System).Bold(true)
 	case "tool":

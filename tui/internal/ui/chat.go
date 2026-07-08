@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hmanlab/hmanlab/tui/internal/llm"
 	"github.com/hmanlab/hmanlab/tui/internal/ui/theme"
 )
@@ -33,30 +35,49 @@ func (m *chatMessage) appendContent(text string) {
 // render returns the styled string for this message, ready to be
 // concatenated into the chat viewport. Width is the column count to
 // wrap markdown + prose to.
-func (m chatMessage) render(width int) string {
+func (m chatMessage) render(bodyW int, fullW int, animTick uint64) string {
 	role := string(m.role)
 	label := role
 	switch role {
 	case "user":
 		label = "user"
 	case "assistant":
-		label = "assistant"
+		label = "hibiscus"
 	case "info":
 		label = "system"
 	}
 
-	// Header: colored role label, matching cli's `▎ role` shape.
-	header := theme.RoleLabelStyle(role).Render("▎ " + label)
+	// Header: colored role label with brand mark for hibiscus.
+	var header string
+	if role == "assistant" {
+		if m.streaming {
+			spinFrames := []string{"✿", "❋", "✾", "❀"}
+			spin := spinFrames[int(animTick/2)%len(spinFrames)]
+			// Pulse the text between Hibiscus and HibiscusGlow in sync
+			// with the flower frames.
+			textColor := theme.Hibiscus
+			if int(animTick/2)%2 == 0 {
+				textColor = theme.HibiscusGlow
+			}
+			header = lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render(spin) +
+				lipgloss.NewStyle().Foreground(textColor).Bold(true).Render(" hibiscus — generating")
+		} else {
+			mark := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("✿")
+			header = theme.RoleLabelStyle(role).Render(fmt.Sprintf("%s hibiscus", mark))
+		}
+	} else {
+		header = theme.RoleLabelStyle(role).Render("▎ " + label)
+	}
 
 	// Body: assistant content goes through the markdown renderer; user
 	// + system content render as plain text (markdown in user input is
 	// usually an accident, not a styling intent).
 	body := m.content
 	if role == "assistant" {
-		body = RenderMarkdown(m.content, width-2)
+		body = RenderMarkdown(m.content, bodyW-2)
 	}
-	if m.cancelled && !strings.HasSuffix(body, "…") {
-		body += " …"
+	if m.cancelled && !strings.HasSuffix(body, "[...]") {
+		body += " [...]"
 	}
 
 	// Indent every body line by 2 cols to clear the gutter.
@@ -66,7 +87,29 @@ func (m chatMessage) render(width int) string {
 		bodyLines[i] = indent + l
 	}
 
-	return header + "\n" + strings.Join(bodyLines, "\n")
+	result := header + "\n" + strings.Join(bodyLines, "\n")
+
+	// User messages get a light grey background card.
+	if role == "user" {
+		lines := strings.Split(result, "\n")
+		for i, l := range lines {
+			clean := ansi.Strip(l)
+			if i == 0 {
+				lines[i] = theme.RoleLabelStyle("user").
+					Background(theme.BGChat).
+					Width(fullW).
+					Render(clean)
+			} else {
+				lines[i] = lipgloss.NewStyle().
+					Background(theme.BGChat).
+					Width(fullW).
+					Render(clean)
+			}
+		}
+		result = strings.Join(lines, "\n")
+	}
+
+	return result
 }
 
 // String is the debug representation — never shown in the TUI.

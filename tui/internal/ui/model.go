@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/hmanlab/hmanlab/tui/internal/config"
 	"github.com/hmanlab/hmanlab/tui/internal/llm"
@@ -53,10 +54,12 @@ type Model struct {
 	connect connectModal
 
 	// stream management for the in-flight assistant response.
-	streamCtx    context.Context
-	streamCancel context.CancelFunc
-	streamCh     <-chan llm.StreamEvent
-	streaming    bool // true iff an assistant response is being streamed
+	streamCtx     context.Context
+	streamCancel  context.CancelFunc
+	streamCh      <-chan llm.StreamEvent
+	streaming     bool   // true iff an assistant response is being streamed
+	streamBuffer  string // pending text not yet flushed to content (word-by-word pacing)
+	streamDone    bool   // channel closed but buffer may still have text
 
 	// animTick drives the blinking caret on the streaming message.
 	// Incremented every ~120ms via tickMsg.
@@ -220,6 +223,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDoneMsg:
 		// Stream finished (Done event from drainStream). Reset state.
 		m.streaming = false
+		m.streamBuffer = ""
+		m.streamDone = false
 		if m.streamCancel != nil {
 			m.streamCancel()
 			m.streamCancel = nil
@@ -268,6 +273,12 @@ func (m Model) updateConnect(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch k := msg.(type) {
 	case tea.KeyMsg:
+		// Filter terminal OSC responses (e.g. background color queries)
+		// that leak as key events — prevents garbage like "1;rgb:..."
+		// from landing in the textarea.
+		if strings.Contains(k.String(), "rgb:") {
+			return m, nil
+		}
 		// Ctrl+C: cancel in-flight stream, or quit if idle on empty input.
 		if k.Type == tea.KeyCtrlC {
 			if m.streaming {
@@ -303,9 +314,9 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// events as tea.MouseMsg (not KeyMsg) — handled by the
 		// default branch forwarding to viewport.Update.
 
-		// Enter: send (unless Shift+Enter for newline — bubbles/textarea
-		// already handles that by inserting a \n).
-		if k.Type == tea.KeyEnter && !m.streaming {
+		// Enter (without Alt): send. Alt+Enter falls through to the
+		// textarea which inserts a newline.
+		if k.Type == tea.KeyEnter && !k.Alt && !m.streaming {
 			text := strings.TrimSpace(m.input.Value())
 			if text == "" {
 				return m, nil
@@ -323,6 +334,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd1, cmd2 tea.Cmd
 	m.input, cmd1 = m.input.Update(msg)
 	m.viewport, cmd2 = m.viewport.Update(msg)
+	m.relayout() // grow/shrink textarea with content
 	return m, tea.Batch(cmd1, cmd2)
 }
 
@@ -333,6 +345,7 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 		role:    llm.RoleUser,
 		content: text,
 	})
+	m.input.Reset()
 
 	// Build the message slice we send to the provider — full history,
 	// excluding the leading info line and any cancelled/empty messages.
@@ -354,6 +367,8 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 	m.streamCtx, m.streamCancel = ctx, cancel
 	m.streamCh = m.provider.StreamChat(ctx, m.model, apiMsgs)
 	m.streaming = true
+	m.streamBuffer = ""
+	m.streamDone = false
 
 	// Push a placeholder assistant message; tokens will accumulate into it.
 	m.history = append(m.history, chatMessage{
@@ -448,54 +463,76 @@ func (m *Model) drainStream() []tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+
+	// Drain all available events into the buffer.
+drainLoop:
 	for {
 		select {
 		case ev, ok := <-m.streamCh:
 			if !ok {
-				// Channel closed — finalize.
-				cmds = append(cmds, func() tea.Msg {
-					return streamDoneMsg{
-						promptTokens:     m.lastPromptTokens,
-						completionTokens: m.lastCompletionTokens,
-					}
-				})
-				return cmds
+				m.streamDone = true
+				break drainLoop
 			}
 			if ev.Err != nil {
-				// Inline-error: append a [system] message and finalize.
 				m.history = append(m.history, infoLine(fmt.Sprintf("✕ error: %s", ev.Err.Error())))
-				cmds = append(cmds, func() tea.Msg {
-					return streamDoneMsg{}
-				})
-				return cmds
+				m.streamDone = true
+				break drainLoop
 			}
 			if ev.Done {
-				cmds = append(cmds, func() tea.Msg {
-					return streamDoneMsg{
-						promptTokens:     ev.PromptTokens,
-						completionTokens: ev.CompletionTokens,
-					}
-				})
-				return cmds
+				m.streamDone = true
+				m.lastPromptTokens = ev.PromptTokens
+				m.lastCompletionTokens = ev.CompletionTokens
+				break drainLoop
 			}
 			if ev.Text != "" {
-				// Append to the trailing streaming message.
-				for i := len(m.history) - 1; i >= 0; i-- {
-					if m.history[i].streaming {
-						m.history[i].content += ev.Text
-						break
-					}
-				}
+				m.streamBuffer += ev.Text
 			}
 		default:
-			// Nothing ready right now — re-render with what we have and
-			// let the next tick pick up more.
-			if m.followTail {
-				m.refreshViewportContent()
-			}
-			return cmds
+			break drainLoop
 		}
 	}
+
+	// Flush one word from the buffer to the streaming message content.
+	// This paces the output to one word per ~120ms tick — a humanized
+	// typewriter effect instead of dumping the whole response at once.
+	if m.streamBuffer != "" {
+		var word string
+		idx := strings.IndexAny(m.streamBuffer, " \n\t")
+		if idx == -1 {
+			// No word boundary yet — only flush if stream is done
+			// (no more text coming to complete the word).
+			if m.streamDone {
+				word = m.streamBuffer
+				m.streamBuffer = ""
+			}
+		} else {
+			word = m.streamBuffer[:idx+1]
+			m.streamBuffer = m.streamBuffer[idx+1:]
+		}
+		if word != "" {
+			for i := len(m.history) - 1; i >= 0; i-- {
+				if m.history[i].streaming {
+					m.history[i].content += word
+					break
+				}
+			}
+		}
+	}
+
+	// Only finalize when the stream is done AND the buffer is empty.
+	if m.streamDone && m.streamBuffer == "" {
+		cmds = append(cmds, func() tea.Msg {
+			return streamDoneMsg{
+				promptTokens:     m.lastPromptTokens,
+				completionTokens: m.lastCompletionTokens,
+			}
+		})
+	}
+
+	if m.followTail {
+		m.refreshViewportContent()
+	}
+	return cmds
 }
 
 // cancelStream aborts the in-flight request. If markCancelled is true,
@@ -509,6 +546,8 @@ func (m *Model) cancelStream(markCancelled bool) {
 		m.streamCancel()
 	}
 	m.streaming = false
+	m.streamBuffer = ""
+	m.streamDone = false
 	for i := len(m.history) - 1; i >= 0; i-- {
 		if m.history[i].streaming {
 			m.history[i].streaming = false
@@ -523,29 +562,38 @@ func (m *Model) cancelStream(markCancelled bool) {
 }
 
 // relayout recomputes viewport + input dimensions after a window
-// resize. Height split (top → bottom):
+// resize or input change. The textarea grows with content up to 15
+// lines, then scrolls internally. Height split (top → bottom):
 //
-//	header (1) + viewport (rest) + input (3 — textarea only, no
-//	border) + status (1) + bottom (1).
-//
-// The bottom row is breathing room — without it the status bar /
-// /help hint sits on the terminal's very last row and reads as
-// crammed. One extra row of BGBase under the status bar lifts the
-// whole footer up by a line and makes the layout feel less tight.
+//	header (1) + viewport (rest) + input (1 padding + N textarea) +
+//	status (1) + bottom (1).
 func (m *Model) relayout() {
 	if m.width < 10 || m.height < 10 {
 		return
 	}
 	const (
-		headerH = 1
-		inputH  = 3 // textarea only — no border, beam lives outside
-		statusH = 1
-		bottomH = 1 // breathing room under status bar
+		headerH  = 1
+		statusH  = 1
+		bottomH  = 1 // breathing room under status bar
+		maxTaLines = 15
+		minTaLines = 3
 	)
+	taLines := strings.Count(m.input.Value(), "\n") + 1
+	if taLines > maxTaLines {
+		taLines = maxTaLines
+	}
+	if taLines < minTaLines {
+		taLines = minTaLines
+	}
+	inputH := taLines + 1 // +1 top padding
 	vpH := m.height - headerH - inputH - statusH - bottomH
+	if vpH < 3 {
+		vpH = 3
+	}
 	if m.mode == ModeChat {
 		m.viewport.Width = m.width
 		m.viewport.Height = vpH
+		m.input.SetHeight(taLines)
 		// Textarea width = total - 1 (slim beam) - 1 (gap after beam).
 		inputW := m.width - 1 - 1
 		if inputW < 10 {
@@ -570,7 +618,7 @@ func (m *Model) refreshViewportContent() {
 	}
 	var blocks []string
 	for _, h := range m.history {
-		blocks = append(blocks, h.render(bodyW))
+		blocks = append(blocks, h.render(bodyW, m.width, m.animTick))
 	}
 	content := strings.Join(blocks, "\n\n")
 	m.viewport.SetContent(content)
@@ -627,25 +675,54 @@ func (m Model) viewChat() string {
 	if m.streaming && (m.animTick/4)%2 == 0 {
 		beamColor = theme.HibiscusGlow
 	}
-	beamRow := lipgloss.NewStyle().Foreground(beamColor).Render("▌")
-	beamCol := strings.Repeat(beamRow+"\n", m.input.Height())
-	beamCol = strings.TrimRight(beamCol, "\n")
+	bgStyle := lipgloss.NewStyle().Background(theme.BGChat)
+	beamStyled := bgStyle.Foreground(beamColor).Render("▌")
+	gapStyled := bgStyle.Render(" ")
 
-	inputRow := lipgloss.JoinHorizontal(lipgloss.Top,
-		beamCol,
-		" ",             // 1-col gap after the beam
-		m.input.View(),
-	)
-	inputBlock := lipgloss.NewStyle().
-		// Width(m.width) forces the wrapper to span the full row so
-		// BG_CHAT fills the entire input area — even when the textarea
-		// is empty (bubbles/textarea only renders bg on cells it
-		// actually outputs, so without Width() the right portion of
-		// the row reverts to whatever was rendered beneath). Content
-		// (beam + space + textarea) stays left-aligned.
-		Width(m.width).
-		Background(theme.BGChat).
-		Render(inputRow)
+	inputW := m.width - 2 // beam + gap
+	if inputW < 10 {
+		inputW = 10
+	}
+
+	var taLines []string
+	if m.input.Value() == "" {
+		// bubbles/textarea's placeholderView emits unstyled trailing
+		// spaces — render the placeholder manually with full BGChat.
+		phStyle := lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FGDim)
+		cursorStyle := lipgloss.NewStyle().Background(theme.FG).Foreground(theme.BGChat)
+		phRunes := []rune(m.input.Placeholder)
+		taLines = make([]string, m.input.Height())
+		for i := 0; i < m.input.Height(); i++ {
+			var content string
+			if i == 0 && len(phRunes) > 0 {
+				content = cursorStyle.Render(string(phRunes[0])) +
+					phStyle.Render(string(phRunes[1:]))
+			}
+			pad := inputW - lipgloss.Width(content)
+			if pad > 0 {
+				content += bgStyle.Render(strings.Repeat(" ", pad))
+			}
+			taLines[i] = beamStyled + gapStyled + content
+		}
+	} else {
+		rawLines := strings.Split(strings.TrimRight(m.input.View(), "\n"), "\n")
+		taLines = make([]string, m.input.Height())
+		for i := 0; i < m.input.Height(); i++ {
+			var line string
+			if i < len(rawLines) {
+				line = rawLines[i]
+			}
+			pad := inputW - ansi.StringWidth(line)
+			if pad > 0 {
+				line += bgStyle.Render(strings.Repeat(" ", pad))
+			}
+			taLines[i] = beamStyled + gapStyled + line
+		}
+	}
+
+	// 1 row of top padding for breathing room above the textarea.
+	topPad := beamStyled + gapStyled + bgStyle.Render(strings.Repeat(" ", inputW))
+	inputBlock := topPad + "\n" + strings.Join(taLines, "\n")
 
 	// ── Status bar ────────────────────────────────────────────────
 	// Three sections, left → right: connection dot + provider + model
@@ -666,10 +743,7 @@ func (m Model) viewChat() string {
 
 	var statusMid string
 	if m.streaming {
-		statusMid = lipgloss.NewStyle().
-			Foreground(theme.HibiscusGlow).
-			Italic(true).
-			Render("generating…")
+		statusMid = "" // generating indicator is in the chat header now
 	} else if m.statusLine == "cancelled" {
 		statusMid = lipgloss.NewStyle().Foreground(theme.Warning).Render("cancelled")
 	} else if m.lastPromptTokens > 0 || m.lastCompletionTokens > 0 {

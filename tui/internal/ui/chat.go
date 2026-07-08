@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -53,17 +54,13 @@ func (m chatMessage) render(bodyW int, fullW int, animTick uint64) string {
 		if m.streaming {
 			spinFrames := []string{"✿", "❋", "✾", "❀"}
 			spin := spinFrames[int(animTick/2)%len(spinFrames)]
-			// Pulse the text between Hibiscus and HibiscusGlow in sync
-			// with the flower frames.
-			textColor := theme.Hibiscus
-			if int(animTick/2)%2 == 0 {
-				textColor = theme.HibiscusGlow
-			}
-			header = lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render(spin) +
-				lipgloss.NewStyle().Foreground(textColor).Bold(true).Render(" hibiscus — generating")
+			breath := breatheHibiscus(animTick)
+			header = lipgloss.NewStyle().Foreground(breath).Render(spin) +
+				lipgloss.NewStyle().Foreground(breath).Bold(true).Render(" hibiscus — generating")
 		} else {
 			mark := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("✿")
-			header = theme.RoleLabelStyle(role).Render(fmt.Sprintf("%s hibiscus", mark))
+			label := lipgloss.NewStyle().Foreground(theme.Hibiscus).Bold(true).Render(" hibiscus")
+			header = mark + label
 		}
 	} else {
 		header = theme.RoleLabelStyle(role).Render("▎ " + label)
@@ -115,4 +112,23 @@ func (m chatMessage) render(bodyW int, fullW int, animTick uint64) string {
 // String is the debug representation — never shown in the TUI.
 func (m chatMessage) String() string {
 	return fmt.Sprintf("[%s] %q", m.role, m.content)
+}
+
+// breatheHibiscus returns a color that oscillates smoothly between
+// Hibiscus (#ff5d8f) and HibiscusGlow (#ff8fb1) along a sine wave,
+// producing a slow breathing effect (~2.4s per full cycle at 120ms
+// ticks). The ease-in/ease-out of the sine curve is what makes it
+// feel like breathing rather than blinking.
+func breatheHibiscus(tick uint64) lipgloss.Color {
+	const period = 20.0
+	phase := math.Sin(float64(tick) * 2 * math.Pi / period)
+	t := (phase + 1) / 2
+	r := lerp(0xff, 0xff, t)
+	g := lerp(0x5d, 0x8f, t)
+	b := lerp(0x8f, 0xb1, t)
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b))
+}
+
+func lerp(a, b int, t float64) int {
+	return a + int(float64(b-a)*t)
 }

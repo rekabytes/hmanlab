@@ -27,7 +27,9 @@ func TestViewChatFullRowWidth(t *testing.T) {
 	cfg, _ := config.Load()
 	cfg.OllamaCloudAPIKey = "sk-test" // skip connect modal, boot straight into chat
 
-	m := New(cfg)
+	m := New(cfg, "/test/project")
+	// Skip the loading screen — boot straight into chat for the test.
+	m.finishLoading()
 	// Set terminal dimensions without going through the WindowSizeMsg
 	// path — relayout + refreshViewportContent pick them up.
 	m.width = width

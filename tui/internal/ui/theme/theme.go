@@ -42,7 +42,7 @@ var (
 	FGDimmer = lipgloss.Color("#454759") // surface1
 
 	BGBase = lipgloss.Color("#1c1c1c") // neutral dark grey
-	BGChat = lipgloss.Color("#3c3c3c") // elevated input surface
+	BGChat = lipgloss.Color("#1c1c1c") // chat + input surface (matches sidebar)
 
 	BGCard       = lipgloss.Color("#313244") // catppuccin surface0
 	BGCardHover  = lipgloss.Color("#585b70") // catppuccin surface2

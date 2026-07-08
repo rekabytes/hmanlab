@@ -34,10 +34,11 @@ func reinit(width int) error {
 		return nil
 	}
 	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		// Dark background → catppuccin-ish dark theme. Matches cli's
-		// BG_BASE palette.
-		glamour.WithEnvironmentConfig(),
+		// Force dark theme — WithAutoStyle() calls termenv.HasDarkBackground()
+		// which sends an OSC 11 query to the terminal. The response leaks a
+		// stray "\" into Bubble Tea's input reader. Our TUI is always dark
+		// (#1c1c1c) so auto-detection is unnecessary.
+		glamour.WithStandardStyle("dark"),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {

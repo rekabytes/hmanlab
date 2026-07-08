@@ -11,11 +11,32 @@ import (
 // shape of cli/src/app/commands/mod.rs::Command but only the variants
 // we ship at v0.
 type slashCommand struct {
-	kind string // "help" "clear" "quit" "model" "unknown"
+	kind string // "help" "clear" "quit" "model" "sessions" "load" "unknown"
 	// arg holds the rest of the line after the command word. For
 	// /model this is the model name (may be empty for the show-current
 	// form). For other commands it's unused.
 	arg string
+}
+
+// commandInfo describes a slash command for the inline autocomplete
+// dropdown.
+type commandInfo struct {
+	display string // "/sessions"
+	kind    string // "sessions"
+	desc    string // "List past sessions"
+}
+
+// allCommands returns every available slash command for the dropdown.
+// Keep in sync with parseSlashCommand's switch.
+func allCommands() []commandInfo {
+	return []commandInfo{
+		{"/help", "help", "Show available commands"},
+		{"/model", "model", "Switch or show current model"},
+		{"/sessions", "sessions", "Browse past sessions"},
+		{"/load", "load", "Load a session by prefix"},
+		{"/clear", "clear", "Clear history, start fresh"},
+		{"/quit", "quit", "Exit"},
+	}
 }
 
 // parseSlashCommand inspects a textarea line, returning a slashCommand
@@ -44,6 +65,10 @@ func parseSlashCommand(line string) (cmd slashCommand, ok bool) {
 		return slashCommand{kind: "quit"}, true
 	case "model":
 		return slashCommand{kind: "model", arg: rest}, true
+	case "sessions", "session":
+		return slashCommand{kind: "sessions", arg: rest}, true
+	case "load":
+		return slashCommand{kind: "load", arg: rest}, true
 	}
 	return slashCommand{kind: "unknown", arg: head}, true
 }
@@ -61,18 +86,18 @@ Current model: %s
 **Slash commands**
 - /help            Show this help
 - /model [name]    Switch model (no arg: show current). Valid: glm-4.7, glm-5, qwen3.5, kimi-k2.6, …
+- /sessions        List past sessions for this project
+- /load [prefix]   Load a session by UUID prefix (no arg: show picker)
 - /clear           Wipe chat history, start a fresh session
 - /quit            Exit (Ctrl+D on empty input also works)
 
 **Keys**
 - Enter            Send message
 - Alt+Enter        New line (in input box)
+- Tab              Focus session sidebar (↑↓ navigate, ⏎ load)
 - Ctrl+C           Cancel in-flight response / exit on empty input
 - PgUp / PgDn      Scroll chat history
 - mouse wheel      Scroll chat history
-
-The agent loop (tool calls, multi-tool grouping, sessions, specialist
-agents) is v0.1+. See tui/docs/development/PRD.md for the roadmap.
 `, currentModel))
 }
 

@@ -23,6 +23,10 @@ func TestParseSlashCommand(t *testing.T) {
 		{"/model", true, "model", ""},
 		{"/model glm-4.7", true, "model", "glm-4.7"},
 		{"  /model   glm-5  ", true, "model", "glm-5"}, // whitespace trimmed
+		{"/sessions", true, "sessions", ""},
+		{"/session", true, "sessions", ""}, // alias
+		{"/load", true, "load", ""},
+		{"/load deadbeef", true, "load", "deadbeef"},
 		{"/bogus", true, "unknown", "bogus"},
 	}
 	for _, c := range cases {
@@ -47,7 +51,7 @@ func TestParseSlashCommand(t *testing.T) {
 // against drift if someone adds a command but forgets the help text.
 func TestHelpTextMentionsCommands(t *testing.T) {
 	out := helpText("glm-4.7")
-	for _, want := range []string{"glm-4.7", "/help", "/clear", "/quit", "/model", "Ollama Cloud", "Hibiscus"} {
+	for _, want := range []string{"glm-4.7", "/help", "/clear", "/quit", "/model", "/sessions", "/load", "Ollama Cloud", "Hibiscus"} {
 		if !contains(out, want) {
 			t.Errorf("helpText missing %q in output:\n%s", want, out)
 		}

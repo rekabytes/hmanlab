@@ -26,6 +26,7 @@ import (
 
 	"github.com/hmanlab/hmanlab/tui/internal/config"
 	"github.com/hmanlab/hmanlab/tui/internal/llm"
+	"github.com/hmanlab/hmanlab/tui/internal/session"
 	"github.com/hmanlab/hmanlab/tui/internal/ui/theme"
 )
 
@@ -34,9 +35,29 @@ import (
 type Mode int
 
 const (
-	ModeConnect Mode = iota
+	ModeLoading Mode = iota
+	ModeConnect
 	ModeChat
 )
+
+// sidebarWidth is the fixed width of the right sessions panel. The
+// sidebar auto-hides on terminals narrower than minChatWidth + sidebarWidth.
+const sidebarWidth = 30
+
+// sidebarVisible returns true when the terminal is wide enough to show
+// the sidebar alongside a usable chat column.
+func sidebarVisible(totalW int) bool {
+	return totalW >= sidebarWidth+40
+}
+
+// chatWidth returns the width available to the chat column (excluding
+// the sidebar + 1-col gap when visible).
+func (m Model) chatWidth() int {
+	if sidebarVisible(m.width) {
+		return m.width - sidebarWidth - 1 // -1 gap between chat and sidebar
+	}
+	return m.width
+}
 
 // Model is the top-level Bubble Tea state. Everything the TUI knows
 // lives on this struct — Update is pure dispatch, View is pure render.
@@ -46,6 +67,49 @@ type Model struct {
 	cfg      *config.Config
 	provider llm.Provider
 	model    string
+
+	// cwd is the working directory the TUI was launched from. Used to
+	// group sessions per-project on disk.
+	cwd string
+
+	// activeSession tracks the JSONL file we're appending to. nil until
+	// the first user message creates one (lazy init).
+	activeSession *session.Active
+
+	// Session picker overlay state (toggled by /sessions, /load).
+	sessionList    []session.SessionSummary
+	sessionCursor  int
+	sessionOverlay bool
+
+	// Slash command autocomplete dropdown state. Shows when the input
+	// starts with "/" and no space has been typed yet.
+	cmdDropdown bool
+	cmdMatches  []commandInfo
+	cmdCursor   int
+
+	// lastKeyWasFiltered is set when a terminal OSC response fragment
+	// is swallowed, so subsequent fragments (], \, ;, digits, etc.)
+	// can be caught too. OSC responses arrive as a rapid chain of
+	// short key events that Bubble Tea couldn't parse as one sequence.
+	lastKeyWasFiltered  bool
+	filterChainCount    int
+
+	// loadingTicks counts ticks during the startup loading screen.
+	// After loadingMaxTicks, we transition to chat/connect.
+	loadingTicks int
+
+	// cleanupTicks counts down after loading finishes. While > 0, we
+	// check the textarea on each tick and clear it if it contains
+	// only OSC garbage (non-letter characters). This catches fragments
+	// that slip through the event-level filter.
+	cleanupTicks int
+
+	// Right sidebar — persistent session list + token stats.
+	sidebarSessions   []session.SessionSummary
+	sidebarCursor     int
+	sidebarFocus      bool
+	totalPromptTokens int
+	totalCompletionTokens int
 
 	history []chatMessage
 	input   textarea.Model
@@ -89,9 +153,10 @@ type Model struct {
 }
 
 // New constructs the initial Model. The caller (cmd/hmanlab-tui/main.go)
-// passes in a loaded config; if the config has no Ollama Cloud key,
-// we boot straight into ModeConnect for the first-run flow.
-func New(cfg *config.Config) Model {
+// passes in a loaded config + the current working directory (used for
+// session grouping). If the config has no Ollama Cloud key, we boot
+// straight into ModeConnect for the first-run flow.
+func New(cfg *config.Config, cwd string) Model {
 	ta := textarea.New()
 	ta.Placeholder = "Send a message…"
 	ta.Prompt = ""
@@ -120,19 +185,33 @@ func New(cfg *config.Config) Model {
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 	m := Model{
-		cfg:        cfg,
-		input:      ta,
-		viewport:   vp,
-		followTail: true,
+		cfg:          cfg,
+		cwd:          cwd,
+		input:        ta,
+		viewport:     vp,
+		followTail:   true,
+		mode:         ModeLoading,
 	}
 
-	if cfg.HasOllamaCloudKey() {
+	return m
+}
+
+// finishLoading transitions from the loading screen to either chat
+// (if a key is configured) or the connect modal. Clears any OSC
+// garbage that may have leaked into the textarea during startup.
+func (m *Model) finishLoading() {
+	m.input.Reset()
+	m.lastKeyWasFiltered = false
+	m.filterChainCount = 0
+	m.cleanupTicks = 5 // ~600ms post-loading garbage cleanup
+	if m.cfg.HasOllamaCloudKey() {
 		m.bootIntoChat()
+		m.relayout()
+		m.refreshViewportContent()
 	} else {
 		m.mode = ModeConnect
 		m.connect = newConnectModal()
 	}
-	return m
 }
 
 // bootIntoChat wires up the provider + model from config and switches
@@ -143,6 +222,7 @@ func (m *Model) bootIntoChat() {
 	m.model = m.cfg.EffectiveModel()
 	m.mode = ModeChat
 	m.statusLine = "ready"
+	m.refreshSidebar()
 	m.history = []chatMessage{
 		infoLine(fmt.Sprintf("Connected to **Ollama Cloud** (%s). Try /help for commands.", m.model)),
 	}
@@ -171,6 +251,26 @@ func tickCmd() tea.Cmd {
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Guard: filter terminal OSC responses before any mode-specific
+	// handling. This runs during ALL modes (including loading) so the
+	// filter flag is set properly even when the response straddles the
+	// loading→chat transition.
+	if k, ok := msg.(tea.KeyMsg); ok {
+		s := k.String()
+		prevFiltered := m.lastKeyWasFiltered
+		m.lastKeyWasFiltered = false
+		m.filterChainCount = 0
+		if isTerminalResponse(s) {
+			m.lastKeyWasFiltered = true
+			return m, nil
+		}
+		if prevFiltered && m.filterChainCount < 15 && isOSCFragment(s) {
+			m.lastKeyWasFiltered = true
+			m.filterChainCount++
+			return m, nil
+		}
+	}
+
 	switch v := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = int(v.Width), int(v.Height)
@@ -179,6 +279,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.animTick++
+		// Post-loading garbage cleanup: if the textarea picked up OSC
+		// fragments that slipped through the event filter, clear it.
+		if m.cleanupTicks > 0 {
+			m.cleanupTicks--
+			if val := m.input.Value(); val != "" && !m.streaming && looksLikeGarbage(val) {
+				m.input.Reset()
+			}
+		}
+		// Loading screen: count ticks, then transition to chat/connect.
+		// This grace period lets terminal OSC responses arrive and be
+		// swallowed before the user can type.
+		if m.mode == ModeLoading {
+			m.loadingTicks++
+			if m.loadingTicks >= loadingMaxTicks {
+				m.finishLoading()
+			}
+			return m, tickCmd()
+		}
 		// Drain the stream channel alongside the tick — gives us
 		// ~120ms-granularity polling on the in-flight response. Cheaper
 		// than spawning a tea.Cmd per chunk and avoids a backlog when
@@ -232,18 +350,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancel = nil
 		}
 		m.streamCh = nil
-		// Mark the trailing message as no longer streaming.
+		// Mark the trailing message as no longer streaming + persist it.
 		for i := len(m.history) - 1; i >= 0; i-- {
 			if m.history[i].streaming {
 				m.history[i].streaming = false
 				if v.cancelled {
 					m.history[i].cancelled = true
 				}
+				// Save the completed (or cancelled) reply to the session.
+				content := m.history[i].content
+				if v.cancelled && !strings.HasSuffix(content, "[...]") {
+					content += " [...]"
+				}
+				if content != "" {
+					if err := m.writeAssistantToSession(content); err != nil {
+						m.history = append(m.history, infoLine(
+							fmt.Sprintf("⚠ couldn't save reply: %v", err)))
+					}
+				}
 				break
 			}
 		}
 		m.lastPromptTokens = v.promptTokens
 		m.lastCompletionTokens = v.completionTokens
+		m.totalPromptTokens += v.promptTokens
+		m.totalCompletionTokens += v.completionTokens
+		m.refreshSidebar()
 		m.statusLine = ""
 		m.refreshViewportContent()
 		return m, nil
@@ -251,6 +383,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Mode-specific routing.
 	switch m.mode {
+	case ModeLoading:
+		return m, nil // swallow all input during loading
 	case ModeConnect:
 		return m.updateConnect(msg)
 	case ModeChat:
@@ -273,13 +407,85 @@ func (m Model) updateConnect(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateChat handles the chat-view key tree.
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Session picker overlay intercepts all keys while open.
+	if m.sessionOverlay {
+		return m.updateSessionOverlay(msg)
+	}
 	switch k := msg.(type) {
 	case tea.KeyMsg:
-		// Filter terminal OSC responses (e.g. background color queries)
-		// that leak as key events — prevents garbage like "1;rgb:..."
-		// from landing in the textarea.
-		if strings.Contains(k.String(), "rgb:") {
-			return m, nil
+		// OSC filtering is handled in the common Update() guard above.
+		// Slash command dropdown: intercept navigation keys while open.
+		if m.cmdDropdown && len(m.cmdMatches) > 0 {
+			switch k.Type {
+			case tea.KeyUp:
+				if m.cmdCursor > 0 {
+					m.cmdCursor--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.cmdCursor < len(m.cmdMatches)-1 {
+					m.cmdCursor++
+				}
+				return m, nil
+			case tea.KeyTab:
+				// Autocomplete the command name, let user type args.
+				selected := m.cmdMatches[m.cmdCursor]
+				m.input.SetValue(selected.display + " ")
+				m.input.CursorEnd()
+				m.cmdDropdown = false
+				return m, nil
+			case tea.KeyEnter:
+				if !m.streaming {
+					selected := m.cmdMatches[m.cmdCursor]
+					m.input.Reset()
+					m.cmdDropdown = false
+					return m.handleSlashCommand(slashCommand{kind: selected.kind})
+				}
+			case tea.KeyEsc:
+				m.cmdDropdown = false
+				return m, nil
+			}
+		}
+		// Tab: toggle sidebar focus (only when dropdown closed, not
+		// streaming, and the sidebar is visible).
+		if k.Type == tea.KeyTab && !m.cmdDropdown && !m.streaming && sidebarVisible(m.width) {
+			m.sidebarFocus = !m.sidebarFocus
+			if m.sidebarFocus {
+				m.input.Blur()
+				m.refreshSidebar()
+				return m, nil
+			}
+			m.input.Focus()
+			return m, textarea.Blink
+		}
+		// Sidebar navigation when focused.
+		if m.sidebarFocus {
+			switch k.Type {
+			case tea.KeyUp:
+				if m.sidebarCursor > 0 {
+					m.sidebarCursor--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.sidebarCursor < len(m.sidebarSessions)-1 {
+					m.sidebarCursor++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				if m.sidebarCursor < len(m.sidebarSessions) {
+					sum := m.sidebarSessions[m.sidebarCursor]
+					if err := m.loadSession(&sum); err != nil {
+						m.history = append(m.history, infoLine(fmt.Sprintf("✕ couldn't load: %v", err)))
+					}
+				}
+				m.sidebarFocus = false
+				m.input.Focus()
+				return m, textarea.Blink
+			case tea.KeyEsc:
+				m.sidebarFocus = false
+				m.input.Focus()
+				return m, textarea.Blink
+			}
 		}
 		// Ctrl+C: cancel in-flight stream, or quit if idle on empty input.
 		if k.Type == tea.KeyCtrlC {
@@ -293,6 +499,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Otherwise: clear the input rather than quit — matches the
 			// cli's "Ctrl+C is interrupt, not exit" UX.
 			m.input.Reset()
+			m.cmdDropdown = false
 			return m, nil
 		}
 		// Ctrl+D on empty input: quit.
@@ -336,8 +543,47 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd1, cmd2 tea.Cmd
 	m.input, cmd1 = m.input.Update(msg)
 	m.viewport, cmd2 = m.viewport.Update(msg)
-	m.relayout() // grow/shrink textarea with content
+	m.relayout()            // grow/shrink textarea with content
+	m.refreshCmdDropdown()  // show/hide slash-command autocomplete
 	return m, tea.Batch(cmd1, cmd2)
+}
+
+// refreshCmdDropdown checks the current input value and shows/hides the
+// slash command autocomplete dropdown. The dropdown appears when the
+// input starts with "/" and contains no spaces (still typing the command
+// name). It disappears once a space is typed (user is entering args) or
+// the input no longer starts with "/".
+func (m *Model) refreshCmdDropdown() {
+	val := m.input.Value()
+	if !strings.HasPrefix(val, "/") {
+		m.cmdDropdown = false
+		return
+	}
+	// Only autocomplete while typing the head word (no space yet).
+	if strings.ContainsAny(val, " \t") {
+		m.cmdDropdown = false
+		return
+	}
+	query := strings.ToLower(val)
+	var matches []commandInfo
+	for _, c := range allCommands() {
+		if strings.HasPrefix(strings.ToLower(c.display), query) {
+			matches = append(matches, c)
+		}
+	}
+	if len(matches) == 0 || (len(matches) == 1 && strings.EqualFold(matches[0].display, val)) {
+		// Exact match already typed — no need to show the dropdown.
+		m.cmdDropdown = false
+		return
+	}
+	m.cmdDropdown = true
+	m.cmdMatches = matches
+	if m.cmdCursor >= len(m.cmdMatches) {
+		m.cmdCursor = len(m.cmdMatches) - 1
+	}
+	if m.cmdCursor < 0 {
+		m.cmdCursor = 0
+	}
 }
 
 // sendUserMessage appends a user turn, opens a streaming request, and
@@ -348,6 +594,13 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 		content: text,
 	})
 	m.input.Reset()
+
+	// Persist to the session JSONL. Create the session lazily on the
+	// first user message (meta record + title), then append the user
+	// record.
+	if err := m.ensureSessionAndWriteUser(text); err != nil {
+		m.history = append(m.history, infoLine(fmt.Sprintf("⚠ couldn't save session: %v", err)))
+	}
 
 	// Build the message slice we send to the provider — full history,
 	// excluding the leading info line and any cancelled/empty messages.
@@ -389,6 +642,7 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 // handleSlashCommand dispatches a parsed slash command. Returns the
 // updated model + any cmd (e.g. tea.Quit for /quit).
 func (m Model) handleSlashCommand(cmd slashCommand) (tea.Model, tea.Cmd) {
+	m.cmdDropdown = false
 	switch cmd.kind {
 	case "help":
 		m.history = append(m.history, chatMessage{
@@ -400,6 +654,10 @@ func (m Model) handleSlashCommand(cmd slashCommand) (tea.Model, tea.Cmd) {
 		m.refreshViewportContent()
 		return m, nil
 	case "clear":
+		m.activeSession = nil // next message starts a fresh session
+		m.totalPromptTokens = 0
+		m.totalCompletionTokens = 0
+		m.refreshSidebar()
 		m.history = []chatMessage{
 			infoLine("History cleared."),
 		}
@@ -439,6 +697,14 @@ func (m Model) handleSlashCommand(cmd slashCommand) (tea.Model, tea.Cmd) {
 		m.followTail = true
 		m.refreshViewportContent()
 		return m, nil
+	case "sessions":
+		return m.openSessionPicker()
+	case "load":
+		prefix := strings.TrimSpace(cmd.arg)
+		if prefix != "" {
+			return m.loadSessionByPrefix(prefix)
+		}
+		return m.openSessionPicker()
 	case "unknown":
 		m.history = append(m.history, infoLine(fmt.Sprintf("✕ unknown command: /%s (try /help)", cmd.arg)))
 		m.input.Reset()
@@ -539,7 +805,8 @@ drainLoop:
 
 // cancelStream aborts the in-flight request. If markCancelled is true,
 // the trailing streaming message gets a trailing […] marker so the user
-// sees the response was truncated rather than complete.
+// sees the response was truncated rather than complete. The partial
+// reply is persisted to the session so it survives a reload.
 func (m *Model) cancelStream(markCancelled bool) {
 	if !m.streaming {
 		return
@@ -556,11 +823,177 @@ func (m *Model) cancelStream(markCancelled bool) {
 			if markCancelled {
 				m.history[i].cancelled = true
 			}
+			// Persist whatever we got before the cancel.
+			content := m.history[i].content
+			if markCancelled && !strings.HasSuffix(content, "[...]") {
+				content += " [...]"
+			}
+			if content != "" {
+				if err := m.writeAssistantToSession(content); err != nil {
+					m.history = append(m.history, infoLine(
+						fmt.Sprintf("⚠ couldn't save reply: %v", err)))
+				}
+			}
 			break
 		}
 	}
 	m.statusLine = "cancelled"
 	m.refreshViewportContent()
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence helpers
+// ---------------------------------------------------------------------------
+
+// ensureSessionAndWriteUser creates the active session (meta record) if
+// none exists yet, then appends the user message. The session title is
+// derived from the first line of the message.
+func (m *Model) ensureSessionAndWriteUser(text string) error {
+	if m.activeSession == nil {
+		id := session.NewID()
+		path, err := session.PathFor(m.cwd, id)
+		if err != nil {
+			return err
+		}
+		title := session.TruncateTitle(text)
+		if err := session.WriteMeta(path, id, title, m.model); err != nil {
+			return err
+		}
+		m.activeSession = &session.Active{SessionID: id, Path: path}
+		// Reset cumulative token counts for the new session.
+		m.totalPromptTokens = 0
+		m.totalCompletionTokens = 0
+		m.refreshSidebar()
+	}
+	return session.WriteUser(m.activeSession.Path, m.activeSession.SessionID, text, m.model)
+}
+
+// writeAssistantToSession appends a completed (or partial) assistant reply.
+func (m *Model) writeAssistantToSession(content string) error {
+	if m.activeSession == nil {
+		return nil // no active session — nothing to persist
+	}
+	return session.WriteAssistant(m.activeSession.Path, m.activeSession.SessionID, content, m.model)
+}
+
+// loadSession replaces the current chat with a saved session's history.
+func (m *Model) loadSession(sum *session.SessionSummary) error {
+	records, err := session.LoadRecords(sum.Path)
+	if err != nil {
+		return err
+	}
+	m.history = []chatMessage{
+		infoLine(fmt.Sprintf("Loaded session: **%s** (%s)", sum.Title, sum.Model)),
+	}
+	for _, r := range records {
+		switch r.Kind {
+		case session.KindUser:
+			m.history = append(m.history, chatMessage{role: llm.RoleUser, content: r.Content})
+		case session.KindAssistant:
+			m.history = append(m.history, chatMessage{role: llm.RoleAssistant, content: r.Content})
+		}
+	}
+	m.activeSession = &session.Active{SessionID: sum.SessionID, Path: sum.Path}
+	m.totalPromptTokens = 0
+	m.totalCompletionTokens = 0
+	m.sidebarCursor = 0
+	m.followTail = true
+	m.refreshViewportContent()
+	m.refreshSidebar()
+	return nil
+}
+
+// refreshSidebar reloads the session list for the current project so the
+// sidebar stays in sync with disk.
+func (m *Model) refreshSidebar() {
+	summaries, err := session.ListSessions(m.cwd)
+	if err != nil || summaries == nil {
+		m.sidebarSessions = nil
+		return
+	}
+	m.sidebarSessions = summaries
+	if m.sidebarCursor >= len(m.sidebarSessions) {
+		m.sidebarCursor = max(0, len(m.sidebarSessions)-1)
+	}
+}
+
+// openSessionPicker loads the session list and shows the overlay.
+func (m Model) openSessionPicker() (tea.Model, tea.Cmd) {
+	summaries, err := session.ListSessions(m.cwd)
+	if err != nil {
+		m.history = append(m.history, infoLine(fmt.Sprintf("✕ couldn't list sessions: %v", err)))
+		m.input.Reset()
+		m.refreshViewportContent()
+		return m, nil
+	}
+	if len(summaries) == 0 {
+		m.history = append(m.history, infoLine("No saved sessions for this project yet."))
+		m.input.Reset()
+		m.refreshViewportContent()
+		return m, nil
+	}
+	m.sessionList = summaries
+	m.sessionCursor = 0
+	m.sessionOverlay = true
+	m.input.Reset()
+	return m, nil
+}
+
+// loadSessionByPrefix resolves a prefix arg and loads the session inline.
+func (m Model) loadSessionByPrefix(prefix string) (tea.Model, tea.Cmd) {
+	summaries, err := session.ListSessions(m.cwd)
+	if err != nil {
+		m.history = append(m.history, infoLine(fmt.Sprintf("✕ couldn't list sessions: %v", err)))
+		m.input.Reset()
+		m.refreshViewportContent()
+		return m, nil
+	}
+	sum, err := session.FindByPrefix(summaries, prefix)
+	if err != nil {
+		m.history = append(m.history, infoLine(fmt.Sprintf("✕ %v", err)))
+		m.input.Reset()
+		m.refreshViewportContent()
+		return m, nil
+	}
+	if err := m.loadSession(sum); err != nil {
+		m.history = append(m.history, infoLine(fmt.Sprintf("✕ couldn't load: %v", err)))
+	}
+	m.input.Reset()
+	return m, nil
+}
+
+// updateSessionOverlay handles keys while the session picker is open.
+func (m Model) updateSessionOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	// OSC filtering is handled in the common Update() guard above.
+	switch k.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.sessionOverlay = false
+		return m, nil
+	case tea.KeyUp:
+		if m.sessionCursor > 0 {
+			m.sessionCursor--
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.sessionCursor < len(m.sessionList)-1 {
+			m.sessionCursor++
+		}
+		return m, nil
+	case tea.KeyEnter:
+		if m.sessionCursor < len(m.sessionList) {
+			sum := m.sessionList[m.sessionCursor]
+			if err := m.loadSession(&sum); err != nil {
+				m.history = append(m.history, infoLine(fmt.Sprintf("✕ couldn't load: %v", err)))
+			}
+		}
+		m.sessionOverlay = false
+		return m, nil
+	}
+	return m, nil
 }
 
 // relayout recomputes viewport + input dimensions after a window
@@ -573,10 +1006,12 @@ func (m *Model) relayout() {
 	if m.width < 10 || m.height < 10 {
 		return
 	}
+	cw := m.chatWidth()
 	const (
-		headerH  = 1
-		statusH  = 1
-		bottomH  = 1 // breathing room under status bar
+		headerH    = 1
+		statusH    = 1
+		bottomH    = 1 // breathing room under status bar
+		gapH       = 1 // breathing room between input and status bar
 		maxTaLines = 15
 		minTaLines = 3
 	)
@@ -588,16 +1023,21 @@ func (m *Model) relayout() {
 		taLines = minTaLines
 	}
 	inputH := taLines + 1 // +1 top padding
-	vpH := m.height - headerH - inputH - statusH - bottomH
+	// Dropdown takes space above the input when visible.
+	dropdownH := 0
+	if m.cmdDropdown && len(m.cmdMatches) > 0 {
+		dropdownH = len(m.cmdMatches)
+	}
+	vpH := m.height - headerH - inputH - statusH - bottomH - gapH - dropdownH
 	if vpH < 3 {
 		vpH = 3
 	}
 	if m.mode == ModeChat {
-		m.viewport.Width = m.width
+		m.viewport.Width = cw
 		m.viewport.Height = vpH
 		m.input.SetHeight(taLines)
-		// Textarea width = total - 1 (slim beam) - 1 (gap after beam).
-		inputW := m.width - 1 - 1
+		// Textarea width = chat col - 1 (slim beam) - 1 (gap after beam).
+		inputW := cw - 1 - 1
 		if inputW < 10 {
 			inputW = 10
 		}
@@ -614,13 +1054,14 @@ const helpHint = "/help for commands"
 // into the viewport. Called on every state change that affects the
 // visible rows: new user message, streaming token, /clear, etc.
 func (m *Model) refreshViewportContent() {
-	bodyW := m.width - 4 // gutter + breathing room
+	cw := m.chatWidth()
+	bodyW := cw - 4 // gutter + breathing room
 	if bodyW < 10 {
 		bodyW = 10
 	}
 	var blocks []string
 	for _, h := range m.history {
-		blocks = append(blocks, h.render(bodyW, m.width, m.animTick))
+		blocks = append(blocks, h.render(bodyW, cw, m.animTick))
 	}
 	content := strings.Join(blocks, "\n\n")
 	m.viewport.SetContent(content)
@@ -635,22 +1076,27 @@ func (m Model) View() string {
 		return "loading…"
 	}
 	switch m.mode {
+	case ModeLoading:
+		return m.viewLoading()
 	case ModeConnect:
 		return m.connect.View(m.width, m.height)
 	case ModeChat:
-		return m.viewChat()
+		view := m.viewChat()
+		if m.sessionOverlay {
+			view = renderSessionOverlay(m.width, m.height, m.sessionList, m.sessionCursor)
+		}
+		return view
 	}
 	return ""
 }
 
-// viewChat renders the single-pane chat layout. Vertical stack
-// (top → bottom): hibiscus header strip · history viewport · input
-// area with thick hibiscus left beam · status bar (model name on the
-// left, /help hint on the right, live indicator in the middle).
+// viewChat renders the chat layout: left chat column + optional right
+// sessions sidebar. Vertical stack per column (top → bottom): header ·
+// history viewport · dropdown · input area · status bar · bottom pad.
 func (m Model) viewChat() string {
+	cw := m.chatWidth()
+
 	// ── Header strip ──────────────────────────────────────────────
-	// Hibiscus flower mark + wordmark on the left, model name on the
-	// right. Both tinted hibiscus so the brand reads at first glance.
 	mark := lipgloss.NewStyle().Foreground(theme.HibiscusGlow).Render("✿")
 	wordmark := lipgloss.NewStyle().
 		Foreground(theme.Hibiscus).
@@ -659,20 +1105,13 @@ func (m Model) viewChat() string {
 	modelStyle := lipgloss.NewStyle().Foreground(theme.FGDim).Italic(true)
 	leftHeader := fmt.Sprintf("%s %s", mark, wordmark)
 	rightHeader := modelStyle.Render(fmt.Sprintf("○ %s", m.model))
-	middle := strings.Repeat(" ", max(0, m.width-lipgloss.Width(leftHeader)-lipgloss.Width(rightHeader)))
+	middle := strings.Repeat(" ", max(0, cw-lipgloss.Width(leftHeader)-lipgloss.Width(rightHeader)))
 	header := lipgloss.NewStyle().
-		Width(m.width).
+		Width(cw).
 		Background(theme.BGBase).
 		Render(leftHeader + middle + rightHeader)
 
 	// ── Input area ────────────────────────────────────────────────
-	// No full border — just a slim 1-col hibiscus left beam, then 1
-	// col of breathing room, then the textarea. The `▌` glyph fills
-	// only the left half of its cell, so the visible beam reads as a
-	// thin pink line — not the chunky 2-col block we had before. While
-	// a response streams, the beam pulses between Hibiscus and
-	// HibiscusGlow on the same anim-tick cadence as the status-bar
-	// dot so the two pulse in sync.
 	beamColor := theme.Hibiscus
 	if m.streaming && (m.animTick/4)%2 == 0 {
 		beamColor = theme.HibiscusGlow
@@ -681,15 +1120,13 @@ func (m Model) viewChat() string {
 	beamStyled := bgStyle.Foreground(beamColor).Render("▌")
 	gapStyled := bgStyle.Render(" ")
 
-	inputW := m.width - 2 // beam + gap
+	inputW := cw - 2 // beam + gap
 	if inputW < 10 {
 		inputW = 10
 	}
 
 	var taLines []string
 	if m.input.Value() == "" {
-		// bubbles/textarea's placeholderView emits unstyled trailing
-		// spaces — render the placeholder manually with full BGChat.
 		phStyle := lipgloss.NewStyle().Background(theme.BGChat).Foreground(theme.FGDim)
 		cursorStyle := lipgloss.NewStyle().Background(theme.FG).Foreground(theme.BGChat)
 		phRunes := []rune(m.input.Placeholder)
@@ -722,15 +1159,10 @@ func (m Model) viewChat() string {
 		}
 	}
 
-	// 1 row of top padding for breathing room above the textarea.
 	topPad := beamStyled + gapStyled + bgStyle.Render(strings.Repeat(" ", inputW))
 	inputBlock := topPad + "\n" + strings.Join(taLines, "\n")
 
 	// ── Status bar ────────────────────────────────────────────────
-	// Three sections, left → right: connection dot + provider + model
-	// · live indicator (streaming pulse or last-turn tokens) · /help
-	// hint. The hint lives here now (same row as the model name) so
-	// the input area can stay visually clean — just the beam + text.
 	var dot string
 	if m.streaming {
 		if (m.animTick/4)%2 == 0 {
@@ -742,10 +1174,17 @@ func (m Model) viewChat() string {
 		dot = lipgloss.NewStyle().Foreground(theme.Hibiscus).Render("●")
 	}
 	statusLeft := fmt.Sprintf("%s ollama-cloud · %s", dot, m.model)
+	if m.activeSession != nil {
+		sid := m.activeSession.SessionID
+		if len(sid) > 8 {
+			sid = sid[:8]
+		}
+		statusLeft += fmt.Sprintf(" · %s", sid)
+	}
 
 	var statusMid string
 	if m.streaming {
-		statusMid = "" // generating indicator is in the chat header now
+		statusMid = ""
 	} else if m.statusLine == "cancelled" {
 		statusMid = lipgloss.NewStyle().Foreground(theme.Warning).Render("cancelled")
 	} else if m.lastPromptTokens > 0 || m.lastCompletionTokens > 0 {
@@ -759,34 +1198,46 @@ func (m Model) viewChat() string {
 		Italic(true).
 		Render(helpHint)
 
-	// Pad between the three sections so left→mid→right layout holds at
-	// any width. Two gaps: left↔mid and mid↔right.
-	gapTotal := m.width - 2 - lipgloss.Width(statusLeft) - lipgloss.Width(statusMid) - lipgloss.Width(statusRight)
+	gapTotal := cw - 2 - lipgloss.Width(statusLeft) - lipgloss.Width(statusMid) - lipgloss.Width(statusRight)
 	gapTotal = max(0, gapTotal)
 	leftGap := gapTotal / 2
 	rightGap := gapTotal - leftGap
 	statusBlock := lipgloss.NewStyle().
-		Width(m.width).
+		Width(cw).
 		Background(theme.BGBase).
 		Foreground(theme.FG).
 		Render(" " + statusLeft + strings.Repeat(" ", leftGap) + statusMid + strings.Repeat(" ", rightGap) + statusRight + " ")
 
-	// Bottom padding row — full-width blank BGBase strip one row tall.
-	// Without this the status bar's footer text sits on the terminal's
-	// very last row, reading as crammed. One row of BGBase lifts the
-	// whole footer up visually and ends the layout on a clean break.
-	bottomBlock := lipgloss.NewStyle().
-		Width(m.width).
-		Background(theme.BGBase).
-		Render(strings.Repeat(" ", m.width))
+	// Bottom padding — transparent so the terminal's default bg shows.
+	bottomBlock := strings.Repeat(" ", cw)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	// Gap between input area and status bar — transparent so the
+	// terminal's default background shows through.
+	gapBlock := strings.Repeat(" ", cw)
+
+	// Slash command autocomplete dropdown.
+	dropdown := ""
+	if m.cmdDropdown && len(m.cmdMatches) > 0 {
+		dropdown = renderCmdDropdown(m.cmdMatches, m.cmdCursor, cw)
+	}
+
+	chatCol := lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		m.viewport.View(),
+		dropdown,
 		inputBlock,
+		gapBlock,
 		statusBlock,
 		bottomBlock,
 	)
+
+	// ── Right sidebar ─────────────────────────────────────────────
+	if !sidebarVisible(m.width) {
+		return chatCol
+	}
+	sidebar := m.renderSidebar()
+	gap := lipgloss.NewStyle().Width(1).Background(theme.BGBase).Render(" ")
+	return lipgloss.JoinHorizontal(lipgloss.Top, chatCol, gap, sidebar)
 }
 
 // workspaceSystemPrompt is the v0 system prompt. At v0 we use a minimal
@@ -809,4 +1260,56 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isTerminalResponse returns true if s looks like a terminal control
+// sequence (OSC color response, cursor position report, etc.) rather
+// than genuine user input. These leak as KeyMsg events when the
+// terminal responds to capability queries Bubble Tea sends at startup.
+func isTerminalResponse(s string) bool {
+	return strings.Contains(s, "rgb:") ||
+		strings.Contains(s, "bg:") ||
+		strings.Contains(s, "fg:") ||
+		strings.Contains(s, "]11;") ||
+		strings.Contains(s, "]10;") ||
+		strings.ContainsRune(s, '\x1b')
+}
+
+// isOSCFragment returns true if s looks like a fragment of an OSC
+// response that arrived as a separate key event — short strings of
+// non-letter characters like "]", "\", ";", "11", "/", hex digits, etc.
+// Letters (except hex a-f and the "rgb"/"bg" indicators) are excluded
+// so normal typing isn't swallowed.
+func isOSCFragment(s string) bool {
+	if len(s) == 0 || len(s) > 30 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f': // hex digits
+		case c == ']' || c == ';' || c == ':' || c == '/' || c == '\\':
+		case c == 'b' || c == 'g' || c == 'r': // "rgb", "bg"
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeGarbage returns true if the textarea value is likely OSC
+// response garbage rather than real user input. Used by the post-loading
+// cleanup to catch fragments that slipped through the event filter.
+// Returns false if the value contains any letter (a-z, A-Z) or space,
+// since those indicate intentional typing.
+func looksLikeGarbage(s string) bool {
+	if len(s) == 0 || len(s) > 30 {
+		return false
+	}
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == ' ' {
+			return false
+		}
+	}
+	return true
 }

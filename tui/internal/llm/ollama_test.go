@@ -41,8 +41,8 @@ func TestStreamChatHappyPath(t *testing.T) {
 	}
 
 	ch := c.StreamChat(context.Background(), "glm-4.7", []Message{
-		{Role: RoleUser, Content: "hi"},
-	})
+		{Role: string(RoleUser), Content: "hi"},
+	}, nil)
 	var text strings.Builder
 	var done StreamEvent
 	for ev := range ch {
@@ -80,7 +80,7 @@ func TestStreamChatAuthFailure(t *testing.T) {
 		base:   srv.URL,
 		http:   srv.Client(),
 	}
-	ch := c.StreamChat(context.Background(), "glm-4.7", nil)
+	ch := c.StreamChat(context.Background(), "glm-4.7", nil, nil)
 	var sawErr error
 	var sawDone bool
 	for ev := range ch {
@@ -118,7 +118,7 @@ func TestStreamChatCancel(t *testing.T) {
 		http:   srv.Client(),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := c.StreamChat(ctx, "glm-4.7", nil)
+	ch := c.StreamChat(ctx, "glm-4.7", nil, nil)
 
 	// Cancel immediately — the in-flight HTTP request should be aborted
 	// and the channel should close.

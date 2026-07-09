@@ -5,7 +5,10 @@
 // another implementation file.
 package llm
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Role labels a message's author. Match these strings against the cli's
 // wire format (cli/src/ollama.rs::ApiMessage::role) so the same JSON
@@ -19,10 +22,40 @@ const (
 )
 
 // Message is a single chat-turn. Mirrors Ollama's chat-message shape
-// (role + content) — no tools at v0, no attachments, no images.
+// (role + content) — extended with tool_calls and tool fields for the
+// agent loop.
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// Tool is a function-definition sent to the model so it knows what
+// tools are available. Mirrors the OpenAI tool shape (also accepted
+// by Ollama).
+type Tool struct {
+	Type     string       `json:"type"` // always "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction is the schema + description for a single tool.
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"` // JSON Schema object
+}
+
+// ToolCall is what the model emits back when it wants to call a tool.
+type ToolCall struct {
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction carries the tool name + parsed arguments.
+type ToolCallFunction struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 // Provider is the chat-completion surface. Implementations must be
@@ -46,29 +79,28 @@ type Provider interface {
 	// Implementations should respect ctx.Done() promptly — Bubble Tea
 	// cancels on Ctrl+C and expects the goroutine to return without
 	// leaking.
-	StreamChat(ctx context.Context, model string, messages []Message) <-chan StreamEvent
+	StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) <-chan StreamEvent
 }
 
 // StreamEvent is what flows back from a StreamChat call. Either a
-// chunk of content tokens (Token.Text may be empty), a terminal Done
+// chunk of content tokens, a batch of tool calls, a terminal Done
 // carrying usage counts, or an Error.
-//
-// Mirrors the cli's StreamItem enum (cli/src/ollama.rs:297) — same
-// variant shape, just Go-flavoured.
 type StreamEvent struct {
 	// Text is a streamed token fragment. Empty on non-Content events.
 	Text string
+
+	// ToolCalls is non-nil when the model wants to call tools.
+	// Accumulated across the stream and emitted as one batch.
+	ToolCalls []ToolCall
 
 	// Done is true on the terminal event — last chunk in the stream.
 	Done bool
 
 	// PromptTokens / CompletionTokens are the usage counts carried on
-	// the terminal chunk. 0 for intermediate events.
+	// the terminal chunk.
 	PromptTokens     int
 	CompletionTokens int
 
-	// Err is set on a stream-level error (network drop, auth failure,
-	// JSON parse failure, etc.). When set, the channel closes right
-	// after this event.
+	// Err is set on a stream-level error.
 	Err error
 }

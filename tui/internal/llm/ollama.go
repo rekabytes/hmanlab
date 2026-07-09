@@ -76,31 +76,31 @@ func (c *CloudOllama) Ping(ctx context.Context) error {
 	return nil
 }
 
-// chatRequest is the JSON body for /api/chat. Mirrors
-// cli/src/ollama.rs::ChatRequest. Tools/think default off at v0.
+// chatRequest is the JSON body for /api/chat.
 type chatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Stream   bool      `json:"stream"`
 	Think    bool      `json:"think"`
+	Tools    []Tool    `json:"tools,omitempty"`
 }
 
 // chatChunk is one line of the newline-delimited streaming response.
-// Only the fields we read at v0 are typed; the rest are ignored.
 type chatChunk struct {
 	Message struct {
-		Content string `json:"content"`
+		Content   string     `json:"content"`
+		ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	} `json:"message"`
-	Done             bool `json:"done"`
-	PromptEvalCount  int  `json:"prompt_eval_count,omitempty"`
-	EvalCount        int  `json:"eval_count,omitempty"`
+	Done            bool `json:"done"`
+	PromptEvalCount int  `json:"prompt_eval_count,omitempty"`
+	EvalCount       int  `json:"eval_count,omitempty"`
 }
 
 // StreamChat implements Provider. The returned channel receives
 // StreamEvent values as the model produces them; the channel closes
 // when the stream ends (Done) or errors out (Err). Cancelling ctx
 // aborts the in-flight HTTP request promptly — no leaked goroutines.
-func (c *CloudOllama) StreamChat(ctx context.Context, model string, messages []Message) <-chan StreamEvent {
+func (c *CloudOllama) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) <-chan StreamEvent {
 	out := make(chan StreamEvent, 16)
 
 	go func() {
@@ -111,6 +111,7 @@ func (c *CloudOllama) StreamChat(ctx context.Context, model string, messages []M
 			Messages: messages,
 			Stream:   true,
 			Think:    false,
+			Tools:    tools,
 		})
 		if err != nil {
 			out <- StreamEvent{Err: fmt.Errorf("marshal request: %w", err)}
@@ -180,6 +181,9 @@ func (c *CloudOllama) StreamChat(ctx context.Context, model string, messages []M
 			}
 			if chunk.Message.Content != "" {
 				out <- StreamEvent{Text: chunk.Message.Content}
+			}
+			if len(chunk.Message.ToolCalls) > 0 {
+				out <- StreamEvent{ToolCalls: chunk.Message.ToolCalls}
 			}
 		}
 		if err := scanner.Err(); err != nil {

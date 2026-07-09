@@ -642,7 +642,7 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 	// Build the message slice we send to the provider — full history,
 	// excluding the leading info line and any cancelled/empty messages.
 	apiMsgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: workspaceSystemPrompt()},
+		{Role: string(llm.RoleSystem), Content: workspaceSystemPrompt()},
 	}
 	for _, h := range m.history {
 		if h.role == llm.RoleSystem {
@@ -651,13 +651,13 @@ func (m Model) sendUserMessage(text string) (tea.Model, tea.Cmd) {
 		if h.content == "" {
 			continue
 		}
-		apiMsgs = append(apiMsgs, llm.Message{Role: h.role, Content: h.content})
+		apiMsgs = append(apiMsgs, llm.Message{Role: string(h.role), Content: h.content})
 	}
 
 	// Open the stream with a cancellable context.
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streamCtx, m.streamCancel = ctx, cancel
-	m.streamCh = m.provider.StreamChat(ctx, m.model, apiMsgs)
+	m.streamCh = m.provider.StreamChat(ctx, m.model, apiMsgs, nil)
 	m.streaming = true
 	m.streamBuffer = ""
 	m.streamDone = false

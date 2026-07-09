@@ -44,19 +44,50 @@ func (c *OpenAICompat) Ping(ctx context.Context) error { return nil }
 
 // StreamChat implements Provider. POSTs to {base}/chat/completions with
 // stream:true and parses the SSE response.
-func (c *OpenAICompat) StreamChat(ctx context.Context, model string, messages []Message) <-chan StreamEvent {
+func (c *OpenAICompat) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 32)
-	go c.stream(ctx, model, messages, ch)
+	go c.stream(ctx, model, messages, tools, ch)
 	return ch
 }
 
-func (c *OpenAICompat) stream(ctx context.Context, model string, messages []Message, ch chan<- StreamEvent) {
+func (c *OpenAICompat) stream(ctx context.Context, model string, messages []Message, tools []Tool, ch chan<- StreamEvent) {
 	defer close(ch)
 
-	type oaiMessage struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+	type oaiTCall struct {
+		ID       string `json:"id,omitempty"`
+		Type     string `json:"type"` // "function"
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"` // JSON-encoded string
+		} `json:"function"`
 	}
+	type oaiMessage struct {
+		Role       string     `json:"role"`
+		Content    string     `json:"content,omitempty"`
+		ToolCalls  []oaiTCall `json:"tool_calls,omitempty"`
+		Name       string     `json:"name,omitempty"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+	}
+
+	oaiMsgs := make([]oaiMessage, len(messages))
+	for i, m := range messages {
+		om := oaiMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+		}
+		for j, tc := range m.ToolCalls {
+			var oc oaiTCall
+			oc.ID = fmt.Sprintf("call_%d", j)
+			oc.Type = "function"
+			oc.Function.Name = tc.Function.Name
+			oc.Function.Arguments = string(tc.Function.Arguments)
+			om.ToolCalls = append(om.ToolCalls, oc)
+		}
+		oaiMsgs[i] = om
+	}
+
 	type oaiRequest struct {
 		Model         string       `json:"model"`
 		Messages      []oaiMessage `json:"messages"`
@@ -65,11 +96,7 @@ func (c *OpenAICompat) stream(ctx context.Context, model string, messages []Mess
 		StreamOptions struct {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options"`
-	}
-
-	oaiMsgs := make([]oaiMessage, len(messages))
-	for i, m := range messages {
-		oaiMsgs[i] = oaiMessage{Role: string(m.Role), Content: m.Content}
+		Tools []Tool `json:"tools,omitempty"`
 	}
 
 	reqBody := oaiRequest{
@@ -77,6 +104,7 @@ func (c *OpenAICompat) stream(ctx context.Context, model string, messages []Mess
 		Messages:  oaiMsgs,
 		Stream:    true,
 		MaxTokens: 32000,
+		Tools:     tools,
 	}
 	reqBody.StreamOptions.IncludeUsage = true
 
@@ -146,14 +174,50 @@ func (c *OpenAICompat) stream(ctx context.Context, model string, messages []Mess
 }
 
 // parseSSE reads the SSE response stream and emits StreamEvents.
+// Tool-call arguments arrive as fragmented deltas — accumulated by
+// index, concatenated, then emitted as one batch.
 func (c *OpenAICompat) parseSSE(ctx context.Context, body io.Reader, ch chan<- StreamEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var promptTokens, completionTokens int
 
+	// Accumulator for fragmented tool calls (arguments arrive in pieces).
+	type partialToolCall struct {
+		Name string
+		Args string
+	}
+	toolCallMap := make(map[int]*partialToolCall)
+
+	flushToolCalls := func() {
+		if len(toolCallMap) == 0 {
+			return
+		}
+		// Emit in index order.
+		maxIdx := -1
+		for i := range toolCallMap {
+			if i > maxIdx {
+				maxIdx = i
+			}
+		}
+		var calls []ToolCall
+		for i := 0; i <= maxIdx; i++ {
+			tc, ok := toolCallMap[i]
+			if !ok {
+				continue
+			}
+			calls = append(calls, ToolCall{
+				Function: ToolCallFunction{
+					Name:      tc.Name,
+					Arguments: json.RawMessage(tc.Args),
+				},
+			})
+		}
+		ch <- StreamEvent{ToolCalls: calls}
+		toolCallMap = make(map[int]*partialToolCall)
+	}
+
 	for scanner.Scan() {
-		// Check for cancellation.
 		select {
 		case <-ctx.Done():
 			ch <- StreamEvent{Err: ctx.Err(), Done: true}
@@ -165,7 +229,6 @@ func (c *OpenAICompat) parseSSE(ctx context.Context, body io.Reader, ch chan<- S
 		if line == "" {
 			continue
 		}
-		// SSE frames start with "data: ". Skip keep-alive comments.
 		payload, ok := strings.CutPrefix(line, "data:")
 		if !ok {
 			continue
@@ -173,19 +236,26 @@ func (c *OpenAICompat) parseSSE(ctx context.Context, body io.Reader, ch chan<- S
 		payload = strings.TrimSpace(payload)
 
 		if payload == "[DONE]" {
+			flushToolCalls()
 			ch <- StreamEvent{
-				Done:              true,
-				PromptTokens:      promptTokens,
-				CompletionTokens:  completionTokens,
+				Done:             true,
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
 			}
 			return
 		}
 
-		// Parse the JSON chunk.
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int `json:"index"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -195,10 +265,9 @@ func (c *OpenAICompat) parseSSE(ctx context.Context, body io.Reader, ch chan<- S
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue // skip malformed
+			continue
 		}
 
-		// Stash usage (may arrive on finish_reason chunk or [DONE]).
 		if chunk.Usage != nil {
 			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 				promptTokens = chunk.Usage.PromptTokens
@@ -206,16 +275,33 @@ func (c *OpenAICompat) parseSSE(ctx context.Context, body io.Reader, ch chan<- S
 			}
 		}
 
-		// Extract content delta.
 		if len(chunk.Choices) > 0 {
-			content := chunk.Choices[0].Delta.Content
-			if content != "" {
-				ch <- StreamEvent{Text: content}
+			choice := chunk.Choices[0]
+
+			// Accumulate tool-call fragments by index.
+			for _, tc := range choice.Delta.ToolCalls {
+				slot, exists := toolCallMap[tc.Index]
+				if !exists {
+					slot = &partialToolCall{}
+					toolCallMap[tc.Index] = slot
+				}
+				if tc.Function.Name != "" {
+					slot.Name = tc.Function.Name
+				}
+				slot.Args += tc.Function.Arguments
+			}
+
+			if choice.Delta.Content != "" {
+				ch <- StreamEvent{Text: choice.Delta.Content}
+			}
+
+			if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
+				flushToolCalls()
 			}
 		}
 	}
 
-	// Stream ended without [DONE] — emit done with whatever usage we have.
+	flushToolCalls()
 	ch <- StreamEvent{
 		Done:             true,
 		PromptTokens:     promptTokens,
